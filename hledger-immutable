@@ -1,0 +1,3 @@
+#!/usr/bin/env bb
+(require '[hledger-immutable.cli :as cli])
+(apply cli/-main *command-line-args*)

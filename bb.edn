@@ -1,0 +1,63 @@
+{:paths ["src" "resources"]
+ :deps {com.layerware/hugsql {:mvn/version "0.5.3"}
+        metosin/malli {:mvn/version "0.16.4"}}
+ :pods {org.babashka/go-sqlite3 {:version "0.3.13"}}
+ :tasks
+ {build:uberjar {:doc "Build the bb --jar compatible uberjar."
+                 :extra-paths ["tasks"]
+                 :requires ([hledger-immutable.build :as build])
+                 :task (build/build-uberjar!)}
+
+  build:prod:osx {:doc "Build a standalone macOS hledger-immutable binary in target/."
+                  :extra-paths ["tasks"]
+                  :requires ([hledger-immutable.build :as build])
+                  :depends [build:uberjar]
+                  :task (build/build-prod! "macos")}
+
+  build:prod:linux {:doc "Build a standalone Linux hledger-immutable binary in target/."
+                    :extra-paths ["tasks"]
+                    :requires ([hledger-immutable.build :as build])
+                    :depends [build:uberjar]
+                    :task (build/build-prod! "linux")}
+
+  build:prod {:doc "Build standalone macOS and Linux hledger-immutable binaries in target/."
+              :depends [build:prod:osx build:prod:linux]}
+
+  build:dev {:doc "Generate the local hledger-immutable pass-through launcher."
+             :extra-paths ["tasks"]
+             :requires ([hledger-immutable.build :as build])
+             :task (build/write-dev-launcher!)}
+
+  build {:doc "Build the local development launcher."
+         :depends [build:dev]}
+
+   test {:doc "Run the full test suite."
+         :extra-paths ["test"]
+         :requires ([clojure.test :as test]
+                    [hledger-immutable.byte-ops-test]
+                    [hledger-immutable.cli-test]
+                    [hledger-immutable.core-test]
+                    [hledger-immutable.db-test]
+                    [hledger-immutable.doctor-test]
+                    [hledger-immutable.encoder-test]
+                    [hledger-immutable.entity-test]
+                    [hledger-immutable.event-log-test]
+                    [hledger-immutable.position-test]
+                    [hledger-immutable.projection-test]
+                    [hledger-immutable.schemas-test])
+         :task (let [result (test/run-tests 'hledger-immutable.byte-ops-test
+                                            'hledger-immutable.cli-test
+                                            'hledger-immutable.core-test
+                                            'hledger-immutable.db-test
+                                            'hledger-immutable.doctor-test
+                                            'hledger-immutable.encoder-test
+                                            'hledger-immutable.entity-test
+                                            'hledger-immutable.event-log-test
+                                            'hledger-immutable.position-test
+                                            'hledger-immutable.projection-test
+                                            'hledger-immutable.schemas-test)]
+                 (when (pos? (+ (:fail result) (:error result)))
+                   (System/exit 1)))}
+
+  ci {:doc "Build prod binaries and run the test suite."
+      :depends [build:prod test]}}}
