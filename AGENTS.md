@@ -55,8 +55,92 @@ low-level file format directly.
 
 Architectural split:
 
+- Keep the main flow visible. Avoid hiding write/read orchestration behind a
+  catch-all workspace namespace. Current production responsibilities are:
+  `schemas.clj` for type registries and validation contracts, `query.clj` for
+  folded read-model queries, `mutation.clj` for command-facing write flows,
+  `projector.clj` for checkpoint-aware projection orchestration, `core.clj` for
+  folding/rendering/parsing logical entities, and `db.*` namespaces for
+  persistence.
+- `schemas.clj` owns stable entity-type facts: top-level types, child types,
+  parent attributes, body attributes, input schemas, position attributes, and
+  amendable attributes. Do not redeclare those registries in production code.
+- `mutation.clj` owns event-log append orchestration. Batch event-log writes
+  should happen inside one existing SQLite `BEGIN IMMEDIATE` transaction; lower
+  table helpers should stay transaction-free unless they encode real persistence
+  policy.
 - `core.clj` owns logical entity work: validating the event log and datoms,
   folding datoms, parsing current entity bodies, and rendering desired entity
   bodies.
 - `byte_ops.clj` should stay dumb: finding entity address bytes, reading/wrapping
   entity bodies, planning byte mutations, and flushing mutations to disk.
+- `doctor.clj` classifies and explains hledger stderr. Storage lookups such as
+  line-to-entity mapping belong in `byte_ops.clj`, not in whole-file scans inside
+  `doctor.clj`.
+
+## Projectability and reportability
+
+- `projectable` means the event-log can fold and emit deterministic `.journal`
+  files. This is the invariant `hledger-immutable` should protect.
+- `reportable` means hledger can parse, finalise, balance, and report on the
+  projected journals. Accounting imbalance is a reportability problem, not a
+  write-time event-log blocker, unless the user explicitly changes that policy.
+- Do not run hledger subprocess checks in the hot write path by default. If a
+  projected journal becomes unreportable, prefer append-only correction through
+  the write API plus `explain-hledger-error` diagnostics over manual journal
+  edits.
+
+## Positioning and ordering
+
+- Automatic positions use `eid * 1000`. Top-level entities use
+  `entity/position`; postings use `posting/position`; tags use `tag/position`.
+- Mutation-facing reordering is identity anchored. Use `after_eid` and
+  `before_eid`; do not reintroduce mutation-side `after_position`.
+- `read-journal --after-position` is only a pagination cursor over projected
+  top-level `entity/position` values.
+- Rebalance crowded positions by emitting ordinary position datoms through the
+  event-log. See `docs/position-reordering.md` before changing planner behavior.
+
+## CLI and agent-facing output
+
+- The CLI is agent-first. Keep help and command output deterministic plain text
+  or JSON; do not add ANSI color.
+- Each command owns its options, examples, and `-h` / `--help` text. Reject
+  command-irrelevant flags instead of silently accepting extras.
+- Preserve the current flag style: no positional arguments for entity ids or
+  data payloads, and render multi-character short aliases with semantic
+  placeholders such as `-eid <entity-id>` and `-peid <parent-entity-id>`.
+- Add commands should project by default. Use `--no-project` only when the
+  caller intentionally wants to append datoms without updating journals.
+- `project --upto <sequence>` is a historical snapshot mode. It writes to
+  `.projections/workspace-<sequence>`, does not advance
+  `last-projected-datom-sequence-number`, and may ignore incomplete trailing
+  entities from the prefix. Normal projection stays strict.
+- `add-tag` creates a child tag attached to a parent entity via
+  `-peid` / `--parent-entity-id`. hledger tag values are optional, so bare tags
+  must render without a trailing colon.
+
+## Storage and database
+
+- The workspace database is `immutable.sqlite` inside the workspace-directory.
+  Current SQLite defaults are WAL mode, `busy_timeout = 5000`, foreign keys on,
+  and `synchronous = NORMAL`.
+- Keep SQL in HugSQL resource files under `resources/`; call generated HugSQL
+  SQL-vector functions directly. Avoid string-building SQL or pass-through
+  helper layers that add no policy.
+- The table vocabulary is `entity_ids`, `event_log`, and
+  `workspace_projection_state`. `event_log(sequence)` is the ordered source of
+  truth; `entity_ids` permanently allocates eids; projection state stores
+  `last_projected_datom_sequence_number`.
+
+## Development workflow
+
+- Prefer `bb test` as the full verification loop. Use focused checks such as
+  `bb hledger-immutable ...`, command-local help output, `bb build`, and
+  `bb ci` when they match the change.
+- Keep `future/` notes narrow and temporary. Verify them against current `src/`,
+  `resources/`, and `test/` before treating them as truth, and prune stale notes
+  once code or docs supersede them.
+- For concurrency design, `BEGIN IMMEDIATE` serializes physical SQLite writers
+  but does not solve logical conflicts. Prefer fact-level compare-and-set
+  semantics for future safe-update work over broad workspace-hash invalidation.
