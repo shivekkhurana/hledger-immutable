@@ -1,7 +1,6 @@
-.clj-kondo/.cache
 target/
 .hledger-immutable.sqlite
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal
-.projections/
+/personal/
