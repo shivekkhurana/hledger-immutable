@@ -82,7 +82,7 @@ pub struct JournalImport {
 #[derive(Debug)]
 struct PendingTransaction(ImportedTransaction);
 
-pub fn read_folder(source: &Path) -> Result<JournalImport, Box<dyn std::error::Error>> {
+pub fn read_folder(source: &Path) -> Result<JournalImport, crate::Error> {
     let root = source.canonicalize()?;
     if !root.is_dir() {
         return Err(format!("Source is not a directory: {}", source.display()).into());
@@ -113,10 +113,7 @@ pub fn read_folder(source: &Path) -> Result<JournalImport, Box<dyn std::error::E
     })
 }
 
-fn collect_journals(
-    directory: &Path,
-    files: &mut Vec<PathBuf>,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn collect_journals(directory: &Path, files: &mut Vec<PathBuf>) -> Result<(), crate::Error> {
     let mut entries = fs::read_dir(directory)?.collect::<Result<Vec<_>, _>>()?;
     entries.sort_by_key(|entry| entry.path());
     for entry in entries {
@@ -138,7 +135,7 @@ fn collect_journals(
     Ok(())
 }
 
-fn relative_key(root: &Path, path: &Path) -> Result<String, Box<dyn std::error::Error>> {
+fn relative_key(root: &Path, path: &Path) -> Result<String, crate::Error> {
     let relative = path.strip_prefix(root)?;
     let parts = relative
         .components()
@@ -158,7 +155,7 @@ fn parse_journal(
     contents: &str,
     known_files: &BTreeSet<String>,
     entities: &mut Vec<ImportedEntity>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), crate::Error> {
     let mut transaction: Option<PendingTransaction> = None;
     for (index, line) in contents.lines().enumerate() {
         let line_number = index + 1;

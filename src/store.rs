@@ -37,7 +37,7 @@ impl fmt::Display for HashConflictError {
 impl std::error::Error for HashConflictError {}
 
 impl Store {
-    pub async fn open(workspace: &Path) -> Result<Self, Box<dyn std::error::Error>> {
+    pub async fn open(workspace: &Path) -> Result<Self, crate::Error> {
         std::fs::create_dir_all(workspace)?;
         let db_path = workspace.join("immutable.sqlite");
         let options = SqliteConnectOptions::new()
@@ -75,7 +75,7 @@ impl Store {
         }))
     }
 
-    async fn ensure_datom_hashes(&self) -> Result<(), Box<dyn std::error::Error>> {
+    async fn ensure_datom_hashes(&self) -> Result<(), crate::Error> {
         let unhashed: i64 =
             sqlx::query_scalar("SELECT count(*) FROM event_log WHERE datom_hash IS NULL")
                 .fetch_one(&self.pool)
@@ -113,7 +113,7 @@ impl Store {
         Ok(())
     }
 
-    pub async fn entities(&self) -> Result<BTreeMap<i64, Entity>, Box<dyn std::error::Error>> {
+    pub async fn entities(&self) -> Result<BTreeMap<i64, Entity>, crate::Error> {
         let rows = sqlx::query(
             "SELECT eid, first_sequence, attributes_json \
              FROM current_entities ORDER BY eid",
@@ -137,7 +137,7 @@ impl Store {
         Ok(entities)
     }
 
-    async fn ensure_current_projection(&self) -> Result<(), Box<dyn std::error::Error>> {
+    async fn ensure_current_projection(&self) -> Result<(), crate::Error> {
         let latest_sequence: i64 =
             sqlx::query_scalar("SELECT coalesce(max(sequence), 0) FROM event_log")
                 .fetch_one(&self.pool)
@@ -218,11 +218,11 @@ impl Store {
     }
 
     pub async fn add_simple(
-        &mut self,
+        &self,
         entity_type: &str,
         data: Value,
         writer_external_id: Option<&str>,
-    ) -> Result<Value, Box<dyn std::error::Error>> {
+    ) -> Result<Value, crate::Error> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let expected_hash = required_string(&data, "lastHash")?.to_owned();
         check_state_hash(&mut tx, &expected_hash).await?;
@@ -260,10 +260,10 @@ impl Store {
     }
 
     pub async fn add_transaction(
-        &mut self,
+        &self,
         data: Value,
         writer_external_id: Option<&str>,
-    ) -> Result<Value, Box<dyn std::error::Error>> {
+    ) -> Result<Value, crate::Error> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let expected_hash = required_string(&data, "lastHash")?.to_owned();
         check_state_hash(&mut tx, &expected_hash).await?;
@@ -315,10 +315,10 @@ impl Store {
     }
 
     pub async fn update_entity(
-        &mut self,
+        &self,
         data: Value,
         writer_external_id: Option<&str>,
-    ) -> Result<Value, Box<dyn std::error::Error>> {
+    ) -> Result<Value, crate::Error> {
         let eid = data
             .get("eid")
             .and_then(Value::as_i64)
@@ -374,11 +374,11 @@ impl Store {
     }
 
     pub async fn delete_entity(
-        &mut self,
+        &self,
         eid: i64,
         expected_hash: &str,
         writer_external_id: Option<&str>,
-    ) -> Result<Value, Box<dyn std::error::Error>> {
+    ) -> Result<Value, crate::Error> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         check_state_hash(&mut tx, expected_hash).await?;
         let all_entities = load_all_current_entities(&mut tx).await?;
@@ -425,11 +425,11 @@ impl Store {
     }
 
     pub async fn import_journals(
-        &mut self,
+        &self,
         source: &Path,
         expected_hash: &str,
         writer_external_id: Option<&str>,
-    ) -> Result<Value, Box<dyn std::error::Error>> {
+    ) -> Result<Value, crate::Error> {
         let journal_import = importer::read_folder(source)?;
         let source_files = journal_import.source_files;
         let imported = journal_import.entities;
@@ -674,7 +674,7 @@ async fn append_datom_events(
 async fn check_state_hash(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     expected: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), crate::Error> {
     let current = current_state_hash_tx(tx).await?;
     if current != expected {
         return Err(Box::new(HashConflictError {
@@ -896,7 +896,7 @@ async fn add_tags(
     datoms: &mut Vec<(i64, &'static str, Value)>,
     parent: i64,
     tags: Option<&Value>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), crate::Error> {
     let Some(tags) = tags.and_then(Value::as_array) else {
         return Ok(());
     };
@@ -915,14 +915,14 @@ async fn add_tags(
     Ok(())
 }
 
-fn required_string(data: &Value, key: &str) -> Result<String, Box<dyn std::error::Error>> {
+fn required_string(data: &Value, key: &str) -> Result<String, crate::Error> {
     Ok(required_value(data, key)?
         .as_str()
         .ok_or_else(|| format!("{key} must be a string"))?
         .to_owned())
 }
 
-fn required_value(data: &Value, key: &str) -> Result<Value, Box<dyn std::error::Error>> {
+fn required_value(data: &Value, key: &str) -> Result<Value, crate::Error> {
     data.get(key)
         .cloned()
         .ok_or_else(|| format!("Missing required field: {key}").into())

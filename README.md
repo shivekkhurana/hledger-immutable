@@ -63,6 +63,38 @@ balances, account include/exclude queries, depth, and tag filters (`--tag
 NAME` or `--tag NAME=VALUE`). `--file`/`-F` follows source-group includes.
 Custom reports can be built on the JSON results.
 
+## Use as a Rust library
+
+The package also exports a library crate named `hledger_immutable`. Add it as a
+path dependency from a server in the same workspace:
+
+```toml
+hledger-immutable = { path = "../hledger-immutable" }
+```
+
+Open the workspace once during server startup, keep the `Store` in shared app
+state, and call the async report or mutation functions from request handlers:
+
+```rust,no_run
+use std::path::Path;
+
+use hledger_immutable::{FilterOptions, Store, ledger};
+
+async fn read_transactions(store: &Store) -> Result<serde_json::Value, hledger_immutable::Error> {
+    let filters = FilterOptions::default();
+    ledger::print(store, &filters).await
+}
+
+async fn open_workspace() -> Result<Store, hledger_immutable::Error> {
+    Store::open(Path::new("./books")).await
+}
+```
+
+The public `options` types are independent of Clap, and the library APIs accept
+shared `&Store` references so servers can put the store in shared application
+state. `Store` owns a SQLx pool and its write methods retain the event-log hash
+check and atomic append behavior.
+
 Write commands include transactions, accounts, commodities, prices, include
 relationships, safe single-attribute updates, and logical entity deletion.
 `status` returns the current workspace `lastHash`. Every mutation requires the

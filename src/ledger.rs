@@ -6,8 +6,8 @@ use rust_decimal::Decimal;
 use serde::Serialize;
 use serde_json::{Value, json};
 
+use crate::options::{FilterOptions, ListOptions, Period, ReportOptions};
 use crate::store::Store;
-use crate::{FilterArgs, ListArgs, Period, ReportArgs};
 
 #[derive(Clone, Debug)]
 pub struct Entity {
@@ -105,10 +105,7 @@ pub enum ReportKind {
     IncomeStatement,
 }
 
-pub async fn accounts(
-    store: &mut Store,
-    args: &ListArgs,
-) -> Result<Value, Box<dyn std::error::Error>> {
+pub async fn accounts(store: &Store, args: &ListOptions) -> Result<Value, crate::Error> {
     let entities = store.entities().await?;
     let selected_files = file_closure(&entities, &args.filters.files);
     let transactions = transactions(&entities, &selected_files)?;
@@ -137,10 +134,7 @@ pub async fn accounts(
     Ok(json!({"command":"accounts", "accounts": names, "count": names.len()}))
 }
 
-pub async fn commodities(
-    store: &mut Store,
-    filters: &FilterArgs,
-) -> Result<Value, Box<dyn std::error::Error>> {
+pub async fn commodities(store: &Store, filters: &FilterOptions) -> Result<Value, crate::Error> {
     let entities = store.entities().await?;
     let selected_files = file_closure(&entities, &filters.files);
     let mut names = BTreeSet::new();
@@ -181,10 +175,7 @@ pub async fn commodities(
     Ok(json!({"command":"commodities", "commodities":commodities, "count":commodities.len()}))
 }
 
-pub async fn print(
-    store: &mut Store,
-    filters: &FilterArgs,
-) -> Result<Value, Box<dyn std::error::Error>> {
+pub async fn print(store: &Store, filters: &FilterOptions) -> Result<Value, crate::Error> {
     validate_filters(filters)?;
     let entities = store.entities().await?;
     let selected_files = file_closure(&entities, &filters.files);
@@ -196,10 +187,7 @@ pub async fn print(
     Ok(json!({"command":"print", "transactions":rows, "count":rows.len()}))
 }
 
-pub async fn register(
-    store: &mut Store,
-    filters: &FilterArgs,
-) -> Result<Value, Box<dyn std::error::Error>> {
+pub async fn register(store: &Store, filters: &FilterOptions) -> Result<Value, crate::Error> {
     validate_filters(filters)?;
     let entities = store.entities().await?;
     let selected_files = file_closure(&entities, &filters.files);
@@ -236,10 +224,10 @@ pub async fn register(
 }
 
 pub async fn balance(
-    store: &mut Store,
-    args: &ReportArgs,
+    store: &Store,
+    args: &ReportOptions,
     kind: ReportKind,
-) -> Result<Value, Box<dyn std::error::Error>> {
+) -> Result<Value, crate::Error> {
     validate_filters(&args.filters)?;
     let entities = store.entities().await?;
     let selected_files = file_closure(&entities, &args.filters.files);
@@ -251,7 +239,7 @@ pub async fn balance(
         Some(value) => date(value)?,
         None => Local::now().date_naive(),
     };
-    let interval = args.interval();
+    let interval = args.interval;
     let target = args.exchange.clone().or_else(|| {
         args.market
             .then(|| default_valuation_commodity(&entities, &prices))
@@ -363,7 +351,7 @@ pub async fn balance(
 fn transactions(
     entities: &BTreeMap<i64, Entity>,
     selected_files: &BTreeSet<String>,
-) -> Result<Vec<Transaction>, Box<dyn std::error::Error>> {
+) -> Result<Vec<Transaction>, crate::Error> {
     let mut postings_by_parent = BTreeMap::<i64, Vec<&Entity>>::new();
     let mut tags_by_parent = BTreeMap::<i64, Vec<Tag>>::new();
     for entity in entities.values() {
@@ -413,7 +401,7 @@ fn transactions(
                     tags: tags_by_parent.get(&entity.eid).cloned().unwrap_or_default(),
                 })
             })
-            .collect::<Result<_, Box<dyn std::error::Error>>>()?;
+            .collect::<Result<_, crate::Error>>()?;
         postings.sort_by_key(|posting| (posting.position, posting.eid));
         infer_missing_amount(&mut postings);
         result.push(Transaction {
@@ -454,7 +442,7 @@ fn in_selected_files(entity: &Entity, files: &BTreeSet<String>) -> bool {
     files.is_empty() || string_attr(entity, "entity/file").is_some_and(|file| files.contains(file))
 }
 
-fn transaction_matches(transaction: &Transaction, filters: &FilterArgs) -> bool {
+fn transaction_matches(transaction: &Transaction, filters: &FilterOptions) -> bool {
     let (begin, end) = date_bounds(filters).unwrap_or((None, None));
     if let Some(begin) = begin {
         if transaction.date < begin {
@@ -482,7 +470,7 @@ fn transaction_matches(transaction: &Transaction, filters: &FilterArgs) -> bool 
             .any(|posting| account_matches(&posting.account, &include, &exclude))
 }
 
-fn validate_filters(filters: &FilterArgs) -> Result<(), Box<dyn std::error::Error>> {
+fn validate_filters(filters: &FilterOptions) -> Result<(), crate::Error> {
     date_bounds(filters)?;
     for term in &filters.query {
         let term = term.strip_prefix("not:").unwrap_or(term);
@@ -494,8 +482,8 @@ fn validate_filters(filters: &FilterArgs) -> Result<(), Box<dyn std::error::Erro
 }
 
 fn date_bounds(
-    filters: &FilterArgs,
-) -> Result<(Option<NaiveDate>, Option<NaiveDate>), Box<dyn std::error::Error>> {
+    filters: &FilterOptions,
+) -> Result<(Option<NaiveDate>, Option<NaiveDate>), crate::Error> {
     let mut begin = filters.begin.as_deref().map(date).transpose()?;
     let mut end = filters.end.as_deref().map(date).transpose()?;
     if let Some(period) = &filters.date_period {
@@ -512,7 +500,7 @@ fn date_bounds(
     Ok((begin, end))
 }
 
-fn parse_date_period(raw: &str) -> Result<(NaiveDate, NaiveDate), Box<dyn std::error::Error>> {
+fn parse_date_period(raw: &str) -> Result<(NaiveDate, NaiveDate), crate::Error> {
     if let Some((start, end)) = raw.split_once("..") {
         let start = date(start)?;
         let end = date(end)?;
@@ -538,7 +526,7 @@ fn parse_date_period(raw: &str) -> Result<(NaiveDate, NaiveDate), Box<dyn std::e
     Err(format!("invalid period {raw:?}; expected YYYY, YYYY-MM, or START..END").into())
 }
 
-fn account_queries(filters: &FilterArgs) -> (Vec<String>, Vec<String>) {
+fn account_queries(filters: &FilterOptions) -> (Vec<String>, Vec<String>) {
     let mut include = filters.accounts.clone();
     let mut exclude = filters.not_accounts.clone();
     for term in &filters.query {
@@ -673,7 +661,7 @@ fn infer_missing_amount(postings: &mut [Posting]) {
     }
 }
 
-fn parse_amount(raw: &str) -> Result<Amount, Box<dyn std::error::Error>> {
+fn parse_amount(raw: &str) -> Result<Amount, crate::Error> {
     let trimmed = raw.trim();
     let cost_split = trimmed
         .split_once("@@")
@@ -704,7 +692,7 @@ fn parse_amount(raw: &str) -> Result<Amount, Box<dyn std::error::Error>> {
     })
 }
 
-fn parse_quantity_commodity(raw: &str) -> Result<(Decimal, String), Box<dyn std::error::Error>> {
+fn parse_quantity_commodity(raw: &str) -> Result<(Decimal, String), crate::Error> {
     let raw = raw.trim();
     if raw.is_empty() {
         return Err("empty amount".into());
@@ -726,7 +714,7 @@ fn parse_quantity_commodity(raw: &str) -> Result<(Decimal, String), Box<dyn std:
     Err(format!("Cannot parse amount: {raw}").into())
 }
 
-fn split_numeric_prefix(token: &str) -> Result<(Decimal, &str), Box<dyn std::error::Error>> {
+fn split_numeric_prefix(token: &str) -> Result<(Decimal, &str), crate::Error> {
     let start = token
         .find(|ch: char| ch.is_ascii_digit() || ch == '-' || ch == '+' || ch == '.')
         .ok_or_else(|| format!("amount has no number: {token}"))?;
@@ -741,7 +729,7 @@ fn split_numeric_prefix(token: &str) -> Result<(Decimal, &str), Box<dyn std::err
     Ok((parse_decimal(number)?, commodity))
 }
 
-fn parse_decimal(raw: &str) -> Result<Decimal, Box<dyn std::error::Error>> {
+fn parse_decimal(raw: &str) -> Result<Decimal, crate::Error> {
     let has_comma = raw.contains(',');
     let has_dot = raw.contains('.');
     let normalized = match (has_comma, has_dot) {
@@ -770,7 +758,7 @@ fn parse_decimal(raw: &str) -> Result<Decimal, Box<dyn std::error::Error>> {
 fn prices(
     entities: &BTreeMap<i64, Entity>,
     selected_files: &BTreeSet<String>,
-) -> Result<Vec<Price>, Box<dyn std::error::Error>> {
+) -> Result<Vec<Price>, crate::Error> {
     entities
         .values()
         .filter(|entity| type_is(entity, "price") && in_selected_files(entity, selected_files))
@@ -826,7 +814,7 @@ fn valued_amount(
     cost_mode: bool,
     market_mode: bool,
     at: NaiveDate,
-) -> Result<BTreeMap<String, Decimal>, Box<dyn std::error::Error>> {
+) -> Result<BTreeMap<String, Decimal>, crate::Error> {
     let (quantity, commodity) = if cost_mode {
         match &amount.cost {
             Some(cost) => (
@@ -958,7 +946,7 @@ fn next_month(date: NaiveDate) -> Option<NaiveDate> {
     }
 }
 
-fn date(raw: &str) -> Result<NaiveDate, Box<dyn std::error::Error>> {
+fn date(raw: &str) -> Result<NaiveDate, crate::Error> {
     Ok(NaiveDate::parse_from_str(raw, "%Y-%m-%d")?)
 }
 fn type_is(entity: &Entity, expected: &str) -> bool {
@@ -1093,9 +1081,9 @@ mod tests {
         assert!(account_matches("Assets:Bank", &["^Assets:.*".into()], &[]));
         assert!(!account_matches("Expenses:Food", &[], &["Expenses".into()]));
         assert!(!account_matches("Income:Sales", &["Expenses".into()], &[]));
-        let filters = FilterArgs {
+        let filters = FilterOptions {
             query: vec!["^Assets".into(), "not:Assets:Hidden".into()],
-            ..FilterArgs::default()
+            ..FilterOptions::default()
         };
         let (include, exclude) = account_queries(&filters);
         assert_eq!(include, ["^Assets"]);
@@ -1153,10 +1141,10 @@ mod tests {
         );
         assert!(parse_date_period("2025-04-01..2025-03-01").is_err());
         assert!(parse_date_period("yesterday").is_err());
-        let filters = FilterArgs {
+        let filters = FilterOptions {
             begin: Some("2025-02-01".into()),
             date_period: Some("2025".into()),
-            ..FilterArgs::default()
+            ..FilterOptions::default()
         };
         assert_eq!(
             date_bounds(&filters).unwrap(),
@@ -1178,24 +1166,24 @@ mod tests {
             name: "trip".into(),
             value: Some("work".into()),
         });
-        let filters = FilterArgs {
+        let filters = FilterOptions {
             begin: Some("2025-02-01".into()),
             end: Some("2025-03-01".into()),
             accounts: vec!["Expenses".into()],
             tags: vec!["trip=work".into()],
-            ..FilterArgs::default()
+            ..FilterOptions::default()
         };
         assert!(transaction_matches(&transaction, &filters));
         assert!(!transaction_matches(
             &transaction,
-            &FilterArgs {
+            &FilterOptions {
                 begin: Some("2025-02-11".into()),
                 ..filters.clone()
             }
         ));
         assert!(!transaction_matches(
             &transaction,
-            &FilterArgs {
+            &FilterOptions {
                 tags: vec!["trip=personal".into()],
                 ..filters
             }

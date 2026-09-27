@@ -1,12 +1,11 @@
-mod importer;
-mod ledger;
-mod store;
-
 use std::{path::PathBuf, process::ExitCode};
 
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
+use hledger_immutable::{
+    Store, ledger,
+    options::{FilterOptions, ListOptions, Period as ApiPeriod, ReportOptions},
+};
 use serde_json::{Value, json};
-use store::Store;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -241,22 +240,61 @@ struct ReportArgs {
 }
 
 impl ReportArgs {
-    fn interval(&self) -> Option<Period> {
-        self.interval_period.or_else(|| {
-            if self.daily {
-                Some(Period::Daily)
-            } else if self.weekly {
-                Some(Period::Weekly)
-            } else if self.monthly {
-                Some(Period::Monthly)
-            } else if self.quarterly {
-                Some(Period::Quarterly)
-            } else if self.yearly {
-                Some(Period::Yearly)
-            } else {
-                None
-            }
-        })
+    fn options(&self) -> ReportOptions {
+        ReportOptions {
+            filters: self.filters.options(),
+            interval: self.interval_period.map(Into::into).or_else(|| {
+                if self.daily {
+                    Some(ApiPeriod::Daily)
+                } else if self.weekly {
+                    Some(ApiPeriod::Weekly)
+                } else if self.monthly {
+                    Some(ApiPeriod::Monthly)
+                } else if self.quarterly {
+                    Some(ApiPeriod::Quarterly)
+                } else if self.yearly {
+                    Some(ApiPeriod::Yearly)
+                } else {
+                    None
+                }
+            }),
+            depth: self.depth,
+            exchange: self.exchange.clone(),
+            cost: self.cost,
+            market: self.market,
+            empty: self.empty,
+            historical: self.historical,
+            today: self.today.clone(),
+            flat: self.flat,
+            layout: self.layout.clone(),
+            no_total: self.no_total,
+            transpose: self.transpose,
+            commodity_style: self.commodity_style.clone(),
+        }
+    }
+}
+
+impl FilterArgs {
+    fn options(&self) -> FilterOptions {
+        FilterOptions {
+            files: self.files.clone(),
+            accounts: self.accounts.clone(),
+            not_accounts: self.not_accounts.clone(),
+            query: self.query.clone(),
+            tags: self.tags.clone(),
+            begin: self.begin.clone(),
+            end: self.end.clone(),
+            date_period: self.date_period.clone(),
+        }
+    }
+}
+
+impl ListArgs {
+    fn options(&self) -> ListOptions {
+        ListOptions {
+            filters: self.filters.options(),
+            depth: self.depth,
+        }
     }
 }
 
@@ -267,6 +305,18 @@ enum Period {
     Monthly,
     Quarterly,
     Yearly,
+}
+
+impl From<Period> for ApiPeriod {
+    fn from(period: Period) -> Self {
+        match period {
+            Period::Daily => Self::Daily,
+            Period::Weekly => Self::Weekly,
+            Period::Monthly => Self::Monthly,
+            Period::Quarterly => Self::Quarterly,
+            Period::Yearly => Self::Yearly,
+        }
+    }
 }
 
 #[tokio::main]
@@ -307,7 +357,9 @@ async fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(error) => {
-            let output = if let Some(conflict) = error.downcast_ref::<store::HashConflictError>() {
+            let output = if let Some(conflict) =
+                error.downcast_ref::<hledger_immutable::HashConflictError>()
+            {
                 json!({
                     "error": {
                         "kind": "hash_conflict",
@@ -325,26 +377,26 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn run(cli: Cli) -> Result<Option<Value>, Box<dyn std::error::Error>> {
+async fn run(cli: Cli) -> Result<Option<Value>, hledger_immutable::Error> {
     let Some(command) = cli.command else {
         return Ok(None);
     };
 
-    let mut store = Store::open(&cli.workspace).await?;
+    let store = Store::open(&cli.workspace).await?;
     let value = match command {
         Command::Status => store.status().await?,
-        Command::Accounts(args) => ledger::accounts(&mut store, &args).await?,
-        Command::Commodities(filters) => ledger::commodities(&mut store, &filters).await?,
-        Command::Print(filters) => ledger::print(&mut store, &filters).await?,
-        Command::Register(filters) => ledger::register(&mut store, &filters).await?,
+        Command::Accounts(args) => ledger::accounts(&store, &args.options()).await?,
+        Command::Commodities(filters) => ledger::commodities(&store, &filters.options()).await?,
+        Command::Print(filters) => ledger::print(&store, &filters.options()).await?,
+        Command::Register(filters) => ledger::register(&store, &filters.options()).await?,
         Command::Balance(args) => {
-            ledger::balance(&mut store, &args, ledger::ReportKind::Balance).await?
+            ledger::balance(&store, &args.options(), ledger::ReportKind::Balance).await?
         }
         Command::BalanceSheet(args) => {
-            ledger::balance(&mut store, &args, ledger::ReportKind::BalanceSheet).await?
+            ledger::balance(&store, &args.options(), ledger::ReportKind::BalanceSheet).await?
         }
         Command::IncomeStatement(args) => {
-            ledger::balance(&mut store, &args, ledger::ReportKind::IncomeStatement).await?
+            ledger::balance(&store, &args.options(), ledger::ReportKind::IncomeStatement).await?
         }
         Command::AddTransaction(data) => {
             store
@@ -414,6 +466,6 @@ async fn run(cli: Cli) -> Result<Option<Value>, Box<dyn std::error::Error>> {
     Ok(Some(value))
 }
 
-fn parse_data(raw: &str) -> Result<Value, Box<dyn std::error::Error>> {
+fn parse_data(raw: &str) -> Result<Value, hledger_immutable::Error> {
     Ok(serde_json::from_str(raw)?)
 }
