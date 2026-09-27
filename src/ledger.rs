@@ -364,6 +364,26 @@ fn transactions(
     entities: &BTreeMap<i64, Entity>,
     selected_files: &BTreeSet<String>,
 ) -> Result<Vec<Transaction>, Box<dyn std::error::Error>> {
+    let mut postings_by_parent = BTreeMap::<i64, Vec<&Entity>>::new();
+    let mut tags_by_parent = BTreeMap::<i64, Vec<Tag>>::new();
+    for entity in entities.values() {
+        if type_is(entity, "posting") {
+            if let Some(parent) = int_attr(entity, "posting/parent-eid") {
+                postings_by_parent.entry(parent).or_default().push(entity);
+            }
+        } else if type_is(entity, "tag")
+            && let Some(parent) = int_attr(entity, "tag/parent-eid")
+        {
+            tags_by_parent.entry(parent).or_default().push(Tag {
+                name: string_attr(entity, "tag/name").unwrap_or("").to_owned(),
+                value: string_attr(entity, "tag/value").map(str::to_owned),
+            });
+        }
+    }
+    for tags in tags_by_parent.values_mut() {
+        tags.sort_by(|a, b| (&a.name, &a.value).cmp(&(&b.name, &b.value)));
+    }
+
     let mut result = Vec::new();
     for root in entities
         .values()
@@ -375,12 +395,10 @@ fn transactions(
         let date = date(
             string_attr(root, "transaction/date").ok_or("transaction missing transaction/date")?,
         )?;
-        let mut postings: Vec<Posting> = entities
-            .values()
-            .filter(|entity| {
-                type_is(entity, "posting")
-                    && int_attr(entity, "posting/parent-eid") == Some(root.eid)
-            })
+        let mut postings: Vec<Posting> = postings_by_parent
+            .get(&root.eid)
+            .into_iter()
+            .flatten()
             .map(|entity| {
                 Ok(Posting {
                     eid: entity.eid,
@@ -392,7 +410,7 @@ fn transactions(
                         .map(parse_amount)
                         .transpose()?,
                     status: string_attr(entity, "posting/status").map(str::to_owned),
-                    tags: tags_for(entities, entity.eid),
+                    tags: tags_by_parent.get(&entity.eid).cloned().unwrap_or_default(),
                 })
             })
             .collect::<Result<_, Box<dyn std::error::Error>>>()?;
@@ -408,7 +426,7 @@ fn transactions(
             status: string_attr(root, "transaction/status").map(str::to_owned),
             code: string_attr(root, "transaction/code").map(str::to_owned),
             file: string_attr(root, "entity/file").map(str::to_owned),
-            tags: tags_for(entities, root.eid),
+            tags: tags_by_parent.get(&root.eid).cloned().unwrap_or_default(),
             postings,
         });
     }
@@ -607,21 +625,6 @@ fn truncate_account(account: &str, depth: Option<usize>) -> String {
         .take(depth.max(1))
         .collect::<Vec<_>>()
         .join(":")
-}
-
-fn tags_for(entities: &BTreeMap<i64, Entity>, parent: i64) -> Vec<Tag> {
-    let mut tags = entities
-        .values()
-        .filter(|entity| {
-            type_is(entity, "tag") && int_attr(entity, "tag/parent-eid") == Some(parent)
-        })
-        .map(|entity| Tag {
-            name: string_attr(entity, "tag/name").unwrap_or("").to_owned(),
-            value: string_attr(entity, "tag/value").map(str::to_owned),
-        })
-        .collect::<Vec<_>>();
-    tags.sort_by(|a, b| (&a.name, &a.value).cmp(&(&b.name, &b.value)));
-    tags
 }
 
 fn transaction_json(transaction: Transaction) -> Value {

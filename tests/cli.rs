@@ -439,6 +439,9 @@ fn legacy_database_is_adopted_without_losing_event_log_history() {
             (10, 3, "posting/parent-eid", "1", 0),
             (11, 3, "posting/account", "\"Equity:Opening\"", 0),
             (12, 3, "posting/amount", "\"USD -10\"", 0),
+            (13, 1, "transaction/status", "\"pending\"", 0),
+            (14, 1, "transaction/status", "\"pending\"", 1),
+            (15, 1, "transaction/description", "\"stale\"", 1),
         ];
         for (sequence, eid, attr, value_json, retract) in rows {
             sqlx::query("INSERT INTO event_log(sequence,eid,attr,value_json,retract) VALUES (?1,?2,?3,?4,?5)")
@@ -451,8 +454,59 @@ fn legacy_database_is_adopted_without_losing_event_log_history() {
     assert_eq!(printed["transactions"][0]["eid"], 1);
     assert_eq!(printed["transactions"][0]["description"], "legacy");
     let status = succeeds(&workspace, &["status"]);
-    assert_eq!(status["latest_sequence"], 12);
-    assert_eq!(status["datom_count"], 12);
+    assert_eq!(status["latest_sequence"], 15);
+    assert_eq!(status["datom_count"], 15);
+
+    let database = workspace.path().join("immutable.sqlite");
+    let options = SqliteConnectOptions::new().filename(&database);
+    let mut connection = futuresless_connect(options);
+    futuresless_block_on(async {
+        let current_entities: i64 = sqlx::query_scalar("SELECT count(*) FROM current_entities")
+            .fetch_one(&mut connection)
+            .await
+            .unwrap();
+        let projected_sequence: i64 =
+            sqlx::query_scalar("SELECT last_sequence FROM current_projection_state WHERE id = 1")
+                .fetch_one(&mut connection)
+                .await
+                .unwrap();
+        assert_eq!(current_entities, 3);
+        assert_eq!(projected_sequence, 15);
+        connection.close().await.unwrap();
+    });
+
+    let added = add_transaction(
+        &workspace,
+        &json!({
+            "file":"main.journal", "date":"2025-01-01", "description":"projection write",
+            "postings":[
+                {"account":"Expenses:Food", "amount":"USD 2"},
+                {"account":"Assets:Cash", "amount":"USD -2"}
+            ]
+        }),
+    );
+    let options = SqliteConnectOptions::new().filename(&database);
+    let mut connection = futuresless_connect(options);
+    futuresless_block_on(async {
+        let projected_sequence: i64 =
+            sqlx::query_scalar("SELECT last_sequence FROM current_projection_state WHERE id = 1")
+                .fetch_one(&mut connection)
+                .await
+                .unwrap();
+        let entity_id = added["eid"].as_i64().unwrap();
+        let attributes_json: String =
+            sqlx::query_scalar("SELECT attributes_json FROM current_entities WHERE eid = ?1")
+                .bind(entity_id)
+                .fetch_one(&mut connection)
+                .await
+                .unwrap();
+        assert_eq!(projected_sequence, added["sequence"]);
+        assert_eq!(
+            serde_json::from_str::<Value>(&attributes_json).unwrap()["transaction/description"],
+            "projection write"
+        );
+        connection.close().await.unwrap();
+    });
 }
 
 #[test]

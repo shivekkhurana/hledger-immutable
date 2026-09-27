@@ -1,8 +1,12 @@
-use std::{collections::BTreeMap, path::Path, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+    time::Duration,
+};
 
 use serde_json::{Value, json};
 use sqlx::{
-    Row, SqlitePool,
+    QueryBuilder, Row, Sqlite, SqlitePool,
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous},
 };
 
@@ -32,10 +36,12 @@ impl Store {
             .connect_with(options)
             .await?;
         sqlx::migrate!("./migrations").run(&pool).await?;
-        Ok(Self {
+        let store = Self {
             pool,
             workspace: workspace.display().to_string(),
-        })
+        };
+        store.ensure_current_projection().await?;
+        Ok(store)
     }
 
     pub async fn status(&self) -> Result<Value, sqlx::Error> {
@@ -53,22 +59,106 @@ impl Store {
 
     pub async fn entities(&self) -> Result<BTreeMap<i64, Entity>, Box<dyn std::error::Error>> {
         let rows = sqlx::query(
-            "SELECT sequence, eid, attr, value_json, retract FROM event_log ORDER BY sequence",
+            "SELECT eid, first_sequence, attributes_json \
+             FROM current_entities ORDER BY eid",
         )
         .fetch_all(&self.pool)
         .await?;
+        let mut entities = BTreeMap::<i64, Entity>::new();
+        for row in rows {
+            let eid: i64 = row.try_get("eid")?;
+            entities.insert(
+                eid,
+                Entity {
+                    eid,
+                    first_sequence: row.try_get("first_sequence")?,
+                    attributes: serde_json::from_str::<BTreeMap<String, Value>>(
+                        &row.try_get::<String, _>("attributes_json")?,
+                    )?,
+                },
+            );
+        }
+        Ok(entities)
+    }
+
+    async fn ensure_current_projection(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let latest_sequence: i64 =
+            sqlx::query_scalar("SELECT coalesce(max(sequence), 0) FROM event_log")
+                .fetch_one(&self.pool)
+                .await?;
+        let projected_sequence: Option<i64> =
+            sqlx::query_scalar("SELECT last_sequence FROM current_projection_state WHERE id = 1")
+                .fetch_optional(&self.pool)
+                .await?;
+
+        if projected_sequence == Some(latest_sequence) {
+            return Ok(());
+        }
+
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let latest_sequence: i64 =
+            sqlx::query_scalar("SELECT coalesce(max(sequence), 0) FROM event_log")
+                .fetch_one(&mut *tx)
+                .await?;
+        let projected_sequence: Option<i64> =
+            sqlx::query_scalar("SELECT last_sequence FROM current_projection_state WHERE id = 1")
+                .fetch_optional(&mut *tx)
+                .await?;
+        if projected_sequence == Some(latest_sequence) {
+            tx.commit().await?;
+            return Ok(());
+        }
+
+        let rows = sqlx::query(
+            "SELECT sequence, eid, attr, value_json, retract FROM event_log ORDER BY sequence",
+        )
+        .fetch_all(&mut *tx)
+        .await?;
         let mut datoms = Vec::with_capacity(rows.len());
         for row in rows {
-            let raw: String = row.try_get("value_json")?;
             datoms.push((
                 row.try_get::<i64, _>("sequence")?,
                 row.try_get::<i64, _>("eid")?,
                 row.try_get::<String, _>("attr")?,
-                serde_json::from_str::<Value>(&raw)?,
+                serde_json::from_str::<Value>(&row.try_get::<String, _>("value_json")?)?,
                 row.try_get::<i64, _>("retract")? != 0,
             ));
         }
-        Ok(fold(datoms))
+        let entities = fold(datoms);
+
+        sqlx::query("DELETE FROM current_entities")
+            .execute(&mut *tx)
+            .await?;
+        for chunk in entities.values().collect::<Vec<_>>().chunks(5_000) {
+            let serialized = chunk
+                .iter()
+                .map(|entity| {
+                    Ok((
+                        entity.eid,
+                        entity.first_sequence,
+                        serde_json::to_string(&entity.attributes)?,
+                    ))
+                })
+                .collect::<Result<Vec<_>, serde_json::Error>>()?;
+            let mut query = QueryBuilder::<Sqlite>::new(
+                "INSERT INTO current_entities (eid, first_sequence, attributes_json) ",
+            );
+            query.push_values(&serialized, |mut row, (eid, sequence, attributes)| {
+                row.push_bind(*eid)
+                    .push_bind(*sequence)
+                    .push_bind(attributes);
+            });
+            query.build().execute(&mut *tx).await?;
+        }
+        sqlx::query(
+            "INSERT INTO current_projection_state (id, last_sequence) VALUES (1, ?1) \
+             ON CONFLICT(id) DO UPDATE SET last_sequence = excluded.last_sequence",
+        )
+        .bind(latest_sequence)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
     }
 
     pub async fn add_simple(
@@ -330,16 +420,147 @@ async fn append_datoms(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     datoms: &[(i64, &str, Value)],
 ) -> Result<(), sqlx::Error> {
+    let touched_eids = datoms
+        .iter()
+        .map(|(eid, _, _)| *eid)
+        .collect::<BTreeSet<_>>();
+    let mut current_entities = load_current_entities(tx, &touched_eids).await?;
+    let mut latest_sequence = None;
     for (eid, attr, value) in datoms {
         let value_json = serde_json::to_string(value).expect("JSON values serialize");
-        sqlx::query(
-            "INSERT INTO event_log (eid, attr, value_json, retract) VALUES (?1, ?2, ?3, 0)",
+        let sequence: i64 = sqlx::query_scalar(
+            "INSERT INTO event_log (eid, attr, value_json, retract) \
+             VALUES (?1, ?2, ?3, 0) RETURNING sequence",
         )
         .bind(eid)
         .bind(attr)
-        .bind(value_json)
+        .bind(&value_json)
+        .fetch_one(&mut **tx)
+        .await?;
+        apply_current_datom(&mut current_entities, *eid, attr, value, false, sequence);
+        latest_sequence = Some(sequence);
+    }
+    replace_current_entities(tx, &touched_eids, &current_entities).await?;
+    if let Some(latest_sequence) = latest_sequence {
+        sqlx::query(
+            "INSERT INTO current_projection_state (id, last_sequence) VALUES (1, ?1) \
+             ON CONFLICT(id) DO UPDATE SET last_sequence = excluded.last_sequence",
+        )
+        .bind(latest_sequence)
         .execute(&mut **tx)
         .await?;
+    }
+    Ok(())
+}
+
+async fn load_current_entities(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    eids: &BTreeSet<i64>,
+) -> Result<BTreeMap<i64, Entity>, sqlx::Error> {
+    let mut entities = BTreeMap::new();
+    for chunk in eids.iter().collect::<Vec<_>>().chunks(500) {
+        let mut query = QueryBuilder::<Sqlite>::new(
+            "SELECT eid, first_sequence, attributes_json FROM current_entities WHERE eid IN (",
+        );
+        let mut separated = query.separated(", ");
+        for eid in chunk {
+            separated.push_bind(**eid);
+        }
+        query.push(")");
+        for row in query.build().fetch_all(&mut **tx).await? {
+            let eid: i64 = row.try_get("eid")?;
+            entities.insert(
+                eid,
+                Entity {
+                    eid,
+                    first_sequence: row.try_get("first_sequence")?,
+                    attributes: serde_json::from_str::<BTreeMap<String, Value>>(
+                        &row.try_get::<String, _>("attributes_json")?,
+                    )
+                    .map_err(|error| sqlx::Error::Decode(Box::new(error)))?,
+                },
+            );
+        }
+    }
+    Ok(entities)
+}
+
+fn apply_current_datom(
+    entities: &mut BTreeMap<i64, Entity>,
+    eid: i64,
+    attr: &str,
+    value: &Value,
+    retract: bool,
+    sequence: i64,
+) {
+    if retract {
+        let should_remove = entities
+            .get(&eid)
+            .and_then(|entity| entity.attributes.get(attr))
+            == Some(value);
+        if should_remove {
+            let entity = entities.get_mut(&eid).expect("entity exists");
+            entity.attributes.remove(attr);
+            if entity.attributes.is_empty() {
+                entities.remove(&eid);
+            }
+        }
+    } else {
+        let entity = entities.entry(eid).or_insert_with(|| Entity {
+            eid,
+            first_sequence: sequence,
+            attributes: BTreeMap::new(),
+        });
+        entity.attributes.insert(attr.to_owned(), value.clone());
+    }
+}
+
+async fn replace_current_entities(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    touched_eids: &BTreeSet<i64>,
+    entities: &BTreeMap<i64, Entity>,
+) -> Result<(), sqlx::Error> {
+    let removed_eids = touched_eids
+        .iter()
+        .filter(|eid| !entities.contains_key(eid))
+        .collect::<Vec<_>>();
+    for chunk in removed_eids.chunks(500) {
+        let mut query = QueryBuilder::<Sqlite>::new("DELETE FROM current_entities WHERE eid IN (");
+        let mut separated = query.separated(", ");
+        for eid in chunk {
+            separated.push_bind(**eid);
+        }
+        query.push(")");
+        query.build().execute(&mut **tx).await?;
+    }
+
+    let serialized = entities
+        .values()
+        .filter(|entity| touched_eids.contains(&entity.eid))
+        .map(|entity| {
+            Ok((
+                entity.eid,
+                entity.first_sequence,
+                serde_json::to_string(&entity.attributes)?,
+            ))
+        })
+        .collect::<Result<Vec<_>, serde_json::Error>>()
+        .map_err(|error| sqlx::Error::Encode(Box::new(error)))?;
+    for chunk in serialized.chunks(5_000) {
+        let mut query = QueryBuilder::<Sqlite>::new(
+            "INSERT INTO current_entities (eid, first_sequence, attributes_json) ",
+        );
+        query.push_values(chunk, |mut row, (eid, sequence, attributes)| {
+            row.push_bind(*eid)
+                .push_bind(*sequence)
+                .push_bind(attributes);
+        });
+        query.push(
+            " ON CONFLICT(eid) DO UPDATE SET \
+             first_sequence = excluded.first_sequence, \
+             attributes_json = excluded.attributes_json",
+        );
+        query.build().execute(&mut **tx).await?;
     }
     Ok(())
 }
