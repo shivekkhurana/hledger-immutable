@@ -36,13 +36,53 @@ impl Drop for Workspace {
     }
 }
 
-fn invoke(workspace: &Workspace, args: &[&str]) -> Output {
+fn invoke_raw(workspace: &Workspace, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_hledger-immutable"))
         .arg("--workspace")
         .arg(workspace.path())
         .args(args)
         .output()
         .expect("start CLI")
+}
+
+fn invoke(workspace: &Workspace, args: &[&str]) -> Output {
+    let Some(command) = args.first().copied() else {
+        return invoke_raw(workspace, args);
+    };
+    let mut owned = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
+    let is_write = matches!(
+        command,
+        "add-transaction"
+            | "add-account"
+            | "add-commodity"
+            | "add-price"
+            | "add-include"
+            | "update"
+            | "delete"
+            | "import-journals"
+    );
+    if !is_write {
+        return invoke_raw(workspace, args);
+    }
+    let last_hash = json_output(invoke_raw(workspace, &["status"]))["lastHash"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    if matches!(command, "delete" | "import-journals") {
+        if !owned.iter().any(|arg| arg == "--last-hash") {
+            owned.extend(["--last-hash".into(), last_hash]);
+        }
+    } else if let Some(data_flag) = owned.iter().position(|arg| arg == "--data") {
+        if let Some(data) = owned.get_mut(data_flag + 1)
+            && let Ok(mut value) = serde_json::from_str::<Value>(data)
+            && value.get("lastHash").is_none()
+        {
+            value["lastHash"] = json!(last_hash);
+            *data = serde_json::to_string(&value).unwrap();
+        }
+    }
+    let refs = owned.iter().map(String::as_str).collect::<Vec<_>>();
+    invoke_raw(workspace, &refs)
 }
 
 fn json_output(output: Output) -> Value {
@@ -66,8 +106,47 @@ fn add_transaction(workspace: &Workspace, data: &Value) -> Value {
     succeeds(workspace, &["add-transaction", "--data", &raw])
 }
 
+#[test]
+fn simple_write_responses_return_the_current_hash() {
+    let workspace = Workspace::new();
+    for (command, data) in [
+        (
+            "add-account",
+            r#"{"file":"accounts.journal","name":"Assets:Cash"}"#,
+        ),
+        (
+            "add-commodity",
+            r#"{"file":"accounts.journal","name":"USD"}"#,
+        ),
+        (
+            "add-price",
+            r#"{"file":"prices.journal","date":"2025-01-01","commodity":"BTC","value":"USD 40000"}"#,
+        ),
+        (
+            "add-include",
+            r#"{"file":"main.journal","path":"prices.journal"}"#,
+        ),
+    ] {
+        let result = succeeds(&workspace, &[command, "--data", data]);
+        assert!(
+            result["lastHash"].as_str().is_some(),
+            "{command} omitted lastHash"
+        );
+        assert_eq!(
+            result["lastHash"],
+            succeeds(&workspace, &["status"])["lastHash"]
+        );
+    }
+}
+
 fn update_entity(workspace: &Workspace, data: &Value) -> Value {
-    let raw = serde_json::to_string(data).unwrap();
+    let mut data = data.clone();
+    data.as_object_mut().unwrap().remove("expect");
+    data.as_object_mut()
+        .unwrap()
+        .entry("lastHash")
+        .or_insert_with(|| succeeds(workspace, &["status"])["lastHash"].clone());
+    let raw = serde_json::to_string(&data).unwrap();
     succeeds(workspace, &["update", "--data", &raw])
 }
 
@@ -192,6 +271,7 @@ fn all_read_commands_and_makefile_report_options_emit_json() {
         status["latest_sequence"].as_i64().unwrap(),
         crypto["sequence"].as_i64().unwrap()
     );
+    assert_eq!(status["lastHash"], crypto["lastHash"]);
 
     let accounts = succeeds(&workspace, &["accounts", "--file", "main.journal"]);
     assert!(
@@ -475,8 +555,21 @@ fn legacy_database_is_adopted_without_losing_event_log_history() {
                 .fetch_one(&mut connection)
                 .await
                 .unwrap();
+        let (datom_count, hashed_count): (i64, i64) =
+            sqlx::query_as("SELECT count(*), count(datom_hash) FROM event_log")
+                .fetch_one(&mut connection)
+                .await
+                .unwrap();
+        let latest_datom_hash: String =
+            sqlx::query_scalar("SELECT datom_hash FROM event_log ORDER BY sequence DESC LIMIT 1")
+                .fetch_one(&mut connection)
+                .await
+                .unwrap();
         assert_eq!(current_entities, 3);
         assert_eq!(projected_sequence, 15);
+        assert_eq!(datom_count, 15);
+        assert_eq!(hashed_count, datom_count);
+        assert_eq!(latest_datom_hash, status["lastHash"].as_str().unwrap());
         connection.close().await.unwrap();
     });
 
@@ -566,6 +659,10 @@ fn update_replaces_an_attribute_and_records_retract_then_assert() {
     assert_eq!(updated["attr"], "transaction/description");
     assert_eq!(updated["value"], "Updated");
     assert_eq!(
+        updated["lastHash"],
+        succeeds(&workspace, &["status"])["lastHash"]
+    );
+    assert_eq!(
         updated["sequence"].as_i64().unwrap(),
         before["latest_sequence"].as_i64().unwrap() + 2
     );
@@ -579,7 +676,7 @@ fn update_replaces_an_attribute_and_records_retract_then_assert() {
     let mut connection = futuresless_connect(options);
     futuresless_block_on(async {
         let rows = sqlx::query(
-            "SELECT value_json, retract FROM event_log WHERE eid = ?1 AND attr = 'transaction/description' ORDER BY sequence",
+            "SELECT value_json, retract, datom_hash FROM event_log WHERE eid = ?1 AND attr = 'transaction/description' ORDER BY sequence",
         )
         .bind(eid)
         .fetch_all(&mut connection)
@@ -596,12 +693,134 @@ fn update_replaces_an_attribute_and_records_retract_then_assert() {
             "\"Updated\""
         );
         assert_eq!(rows[2].try_get::<i64, _>("retract").unwrap(), 0);
+        for row in &rows {
+            assert_eq!(row.try_get::<String, _>("datom_hash").unwrap().len(), 64);
+        }
+        let latest_hash: String =
+            sqlx::query_scalar("SELECT datom_hash FROM event_log ORDER BY sequence DESC LIMIT 1")
+                .fetch_one(&mut connection)
+                .await
+                .unwrap();
+        assert_eq!(latest_hash, updated["lastHash"].as_str().unwrap());
         connection.close().await.unwrap();
     });
 }
 
 #[test]
-fn stale_update_returns_structured_conflict_without_appending_datoms() {
+fn writer_external_id_is_recorded_on_every_datom_from_a_mutation() {
+    let workspace = Workspace::new();
+    let initial_hash = succeeds(&workspace, &["status"])["lastHash"].clone();
+    let transaction_data = serde_json::to_string(&json!({
+        "lastHash": initial_hash,
+        "file": "main.journal",
+        "date": "2025-01-01",
+        "description": "Tagged transaction",
+        "tags": [{"name": "project", "value": "audit"}],
+        "postings": [
+            {"account": "Expenses:Food", "amount": "USD 5"},
+            {"account": "Assets:Cash", "amount": "USD -5"}
+        ]
+    }))
+    .unwrap();
+    let added = json_output(invoke(
+        &workspace,
+        &[
+            "add-transaction",
+            "--data",
+            &transaction_data,
+            "--writer-external-id",
+            "ui-user-42",
+        ],
+    ));
+    assert!(added["lastHash"].as_str().is_some());
+
+    let other_workspace = Workspace::new();
+    let other_initial_hash = succeeds(&other_workspace, &["status"])["lastHash"].clone();
+    let other_data = serde_json::to_string(&json!({
+        "lastHash": other_initial_hash,
+        "file": "main.journal",
+        "date": "2025-01-01",
+        "description": "Tagged transaction",
+        "tags": [{"name": "project", "value": "audit"}],
+        "postings": [
+            {"account": "Expenses:Food", "amount": "USD 5"},
+            {"account": "Assets:Cash", "amount": "USD -5"}
+        ]
+    }))
+    .unwrap();
+    let other_added = json_output(invoke(
+        &other_workspace,
+        &[
+            "add-transaction",
+            "--data",
+            &other_data,
+            "--writer-external-id",
+            "ui-user-99",
+        ],
+    ));
+    assert_ne!(added["lastHash"], other_added["lastHash"]);
+
+    let database = workspace.path().join("immutable.sqlite");
+    let options = SqliteConnectOptions::new().filename(&database);
+    let mut connection = futuresless_connect(options);
+    futuresless_block_on(async {
+        let (datom_count, attributed_count): (i64, i64) =
+            sqlx::query_as("SELECT count(*), count(writer_external_id) FROM event_log")
+                .fetch_one(&mut connection)
+                .await
+                .unwrap();
+        assert!(datom_count > 10);
+        assert_eq!(attributed_count, datom_count);
+        let wrong_writer_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM event_log WHERE writer_external_id != 'ui-user-42'",
+        )
+        .fetch_one(&mut connection)
+        .await
+        .unwrap();
+        assert_eq!(wrong_writer_count, 0);
+    });
+
+    let transaction_eid = added["eid"].as_i64().unwrap();
+    let updated = json_output(invoke(
+        &workspace,
+        &[
+            "update",
+            "--writer-external-id",
+            "ui-user-99",
+            "--data",
+            &serde_json::to_string(&json!({
+                "eid": transaction_eid,
+                "attr": "transaction/description",
+                "value": "Edited",
+                "lastHash": added["lastHash"]
+            }))
+            .unwrap(),
+        ],
+    ));
+    assert!(updated["lastHash"].as_str().is_some());
+    futuresless_block_on(async {
+        let rows = sqlx::query(
+            "SELECT retract, writer_external_id FROM event_log ORDER BY sequence DESC LIMIT 2",
+        )
+        .fetch_all(&mut connection)
+        .await
+        .unwrap();
+        assert_eq!(
+            rows[0].try_get::<String, _>("writer_external_id").unwrap(),
+            "ui-user-99"
+        );
+        assert_eq!(
+            rows[1].try_get::<String, _>("writer_external_id").unwrap(),
+            "ui-user-99"
+        );
+        assert_eq!(rows[0].try_get::<i64, _>("retract").unwrap(), 0);
+        assert_eq!(rows[1].try_get::<i64, _>("retract").unwrap(), 1);
+        connection.close().await.unwrap();
+    });
+}
+
+#[test]
+fn stale_hash_rejects_update_add_delete_and_import() {
     let workspace = Workspace::new();
     let transaction = add_transaction(
         &workspace,
@@ -611,9 +830,14 @@ fn stale_update_returns_structured_conflict_without_appending_datoms() {
         }),
     );
     let eid = transaction["eid"].as_i64().unwrap();
-    update_entity(
+    let stale_hash = succeeds(&workspace, &["status"])["lastHash"].clone();
+    let intervening = succeeds(
         &workspace,
-        &json!({"eid":eid,"attr":"transaction/description","expect":"Original","value":"First edit"}),
+        &[
+            "add-commodity",
+            "--data",
+            r#"{"file":"accounts.journal","name":"EUR"}"#,
+        ],
     );
     let before = succeeds(&workspace, &["status"]);
     let output = invoke(
@@ -621,19 +845,66 @@ fn stale_update_returns_structured_conflict_without_appending_datoms() {
         &[
             "update",
             "--data",
-            &serde_json::to_string(&json!({"eid":eid,"attr":"transaction/description","expect":"Original","value":"Stale edit"})).unwrap(),
+            &serde_json::to_string(&json!({"eid":eid,"attr":"transaction/description","lastHash":stale_hash,"value":"Stale edit"})).unwrap(),
         ],
     );
     assert!(!output.status.success());
     let conflict = json_output(output);
-    assert_eq!(conflict["error"]["kind"], "conflict");
-    assert_eq!(conflict["error"]["eid"], eid);
-    assert_eq!(conflict["error"]["attr"], "transaction/description");
-    assert_eq!(conflict["error"]["expected"], "Original");
-    assert_eq!(conflict["error"]["current"], "First edit");
+    assert_eq!(conflict["error"]["kind"], "hash_conflict");
+    assert_eq!(conflict["error"]["expected"], stale_hash);
+    assert_ne!(conflict["error"]["current"], stale_hash);
+    assert!(intervening["eid"].as_i64().is_some());
+
+    let stale_add = invoke(
+        &workspace,
+        &[
+            "add-account",
+            "--data",
+            &serde_json::to_string(&json!({
+                "lastHash": stale_hash,
+                "file": "accounts.journal",
+                "name": "Assets:Stale"
+            }))
+            .unwrap(),
+        ],
+    );
+    assert_eq!(json_output(stale_add)["error"]["kind"], "hash_conflict");
+
+    let stale_delete = invoke(
+        &workspace,
+        &[
+            "delete",
+            "--eid",
+            &eid.to_string(),
+            "--last-hash",
+            stale_hash.as_str().unwrap(),
+        ],
+    );
+    assert_eq!(json_output(stale_delete)["error"]["kind"], "hash_conflict");
+
+    let source = workspace.path().join("empty-import-source");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("empty.journal"), "").unwrap();
+    let source_arg = source.to_str().unwrap();
+    let stale_import = invoke(
+        &workspace,
+        &[
+            "import-journals",
+            "--source",
+            source_arg,
+            "--last-hash",
+            stale_hash.as_str().unwrap(),
+        ],
+    );
+    assert_eq!(json_output(stale_import)["error"]["kind"], "hash_conflict");
+
     assert_eq!(
         succeeds(&workspace, &["status"])["latest_sequence"],
         before["latest_sequence"]
+    );
+    assert_eq!(
+        succeeds(&workspace, &["print"])["transactions"][0]["description"],
+        "Original"
     );
 }
 
@@ -650,9 +921,10 @@ fn update_rejects_structural_attributes_and_wrong_value_types() {
     );
     let eid = account["eid"].as_i64().unwrap();
     let before = succeeds(&workspace, &["status"])["latest_sequence"].clone();
+    let last_hash = succeeds(&workspace, &["status"])["lastHash"].clone();
     for data in [
-        json!({"eid":eid,"attr":"entity/type","expect":"account","value":"posting"}),
-        json!({"eid":eid,"attr":"account/name","expect":"Assets:Cash","value":42}),
+        json!({"eid":eid,"attr":"entity/type","lastHash":last_hash,"value":"posting"}),
+        json!({"eid":eid,"attr":"account/name","lastHash":last_hash,"value":42}),
     ] {
         let output = invoke(
             &workspace,
@@ -681,6 +953,10 @@ fn delete_retracts_root_and_owned_children_and_is_atomic() {
     let deleted = succeeds(&workspace, &["delete", "--eid", &eid.to_string()]);
     assert_eq!(deleted["eid"], eid);
     assert_eq!(deleted["deleted_eids"].as_array().unwrap().len(), 5);
+    assert_eq!(
+        deleted["lastHash"],
+        succeeds(&workspace, &["status"])["lastHash"]
+    );
     assert_eq!(succeeds(&workspace, &["print"])["count"], 0);
 
     let database = workspace.path().join("immutable.sqlite");
@@ -873,6 +1149,10 @@ fn imports_multiple_journals_recursively_without_modifying_source_files() {
     assert_eq!(imported["imported"], true);
     assert_eq!(imported["source_files"], 3);
     assert_eq!(imported["transactions"], 1);
+    assert_eq!(
+        imported["lastHash"],
+        succeeds(&workspace, &["status"])["lastHash"]
+    );
     assert_eq!(snapshot_files(&source), before);
 
     let print = succeeds(

@@ -76,35 +76,35 @@ enum Command {
     Status,
     /// Append a JSON transaction to the immutable event log.
     #[command(after_help = r#"Example:
-  ./target/release/hledger-immutable --workspace ./books add-transaction --data '{"file":"personal.journal","date":"2025-04-03","description":"Groceries","postings":[{"account":"Expenses:Food","amount":"INR 500"},{"account":"Assets:Cash","amount":"INR -500"}]}'"#)]
+  ./target/release/hledger-immutable --workspace ./books add-transaction --writer-external-id ui-user-42 --data '{"lastHash":"HASH_FROM_STATUS","file":"personal.journal","date":"2025-04-03","description":"Groceries","postings":[{"account":"Expenses:Food","amount":"INR 500"},{"account":"Assets:Cash","amount":"INR -500"}]}'"#)]
     AddTransaction(JsonData),
     /// Append a JSON account declaration.
     #[command(after_help = r#"Example:
-  ./target/release/hledger-immutable --workspace ./books add-account --data '{"file":"accounts.journal","name":"Assets:Cash"}'"#)]
+  ./target/release/hledger-immutable --workspace ./books add-account --data '{"lastHash":"HASH_FROM_STATUS","file":"accounts.journal","name":"Assets:Cash"}'"#)]
     AddAccount(JsonData),
     /// Append a JSON commodity declaration.
     #[command(after_help = r#"Example:
-  ./target/release/hledger-immutable --workspace ./books add-commodity --data '{"file":"accounts.journal","name":"INR"}'"#)]
+  ./target/release/hledger-immutable --workspace ./books add-commodity --data '{"lastHash":"HASH_FROM_STATUS","file":"accounts.journal","name":"INR"}'"#)]
     AddCommodity(JsonData),
     /// Append a JSON market-price record.
     #[command(after_help = r#"Example:
-  ./target/release/hledger-immutable --workspace ./books add-price --data '{"file":"prices.journal","date":"2025-04-03","commodity":"BTC","value":"USD 84000"}'"#)]
+  ./target/release/hledger-immutable --workspace ./books add-price --data '{"lastHash":"HASH_FROM_STATUS","file":"prices.journal","date":"2025-04-03","commodity":"BTC","value":"USD 84000"}'"#)]
     AddPrice(JsonData),
     /// Append a JSON logical source-group include relationship.
     #[command(after_help = r#"Example:
-  ./target/release/hledger-immutable --workspace ./books add-include --data '{"file":"main.journal","path":"prices.journal"}'"#)]
+  ./target/release/hledger-immutable --workspace ./books add-include --data '{"lastHash":"HASH_FROM_STATUS","file":"main.journal","path":"prices.journal"}'"#)]
     AddInclude(JsonData),
-    /// Safely replace one entity attribute when its current value matches.
+    /// Safely replace one entity attribute when the workspace hash matches.
     #[command(after_help = r#"Example:
-  ./target/release/hledger-immutable --workspace ./books update --data '{"eid":42,"attr":"posting/amount","expect":"USD -80","value":"USD -90"}'"#)]
+  ./target/release/hledger-immutable --workspace ./books update --data '{"eid":42,"attr":"posting/amount","lastHash":"HASH_FROM_STATUS","value":"USD -90"}'"#)]
     Update(JsonData),
     /// Logically delete an entity and its owned child entities.
     #[command(after_help = r#"Example:
-  ./target/release/hledger-immutable --workspace ./books delete --eid 42"#)]
+  ./target/release/hledger-immutable --workspace ./books delete --eid 42 --last-hash HASH_FROM_STATUS --writer-external-id ui-user-42"#)]
     Delete(DeleteArgs),
     /// Read .journal files from a source folder and append them to an empty event log.
     #[command(after_help = r#"Example:
-  ./target/release/hledger-immutable --workspace ./books import-journals --source ./journals
+  ./target/release/hledger-immutable --workspace ./books import-journals --source ./journals --last-hash HASH_FROM_STATUS --writer-external-id ui-user-42
 
 The source folder is read-only. The importer scans its .journal files recursively,
 preserves relative source-group names and include relationships, and refuses to
@@ -117,6 +117,9 @@ struct JsonData {
     /// JSON object describing the entity.
     #[arg(short, long)]
     data: String,
+    /// External identity of the writer; copied to every datom produced by this command.
+    #[arg(long = "writer-external-id")]
+    writer_external_id: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -124,6 +127,12 @@ struct ImportArgs {
     /// Folder containing source .journal files. Files are never modified.
     #[arg(short, long)]
     source: PathBuf,
+    /// Workspace hash returned by status, required to guard this write.
+    #[arg(long = "last-hash")]
+    last_hash: String,
+    /// External identity of the writer; copied to every imported datom.
+    #[arg(long = "writer-external-id")]
+    writer_external_id: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -131,6 +140,12 @@ struct DeleteArgs {
     /// Entity id to delete.
     #[arg(long)]
     eid: i64,
+    /// Workspace hash returned by status, required to guard this write.
+    #[arg(long = "last-hash")]
+    last_hash: String,
+    /// External identity of the writer; copied to every retraction datom.
+    #[arg(long = "writer-external-id")]
+    writer_external_id: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -292,13 +307,11 @@ async fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(error) => {
-            let output = if let Some(conflict) = error.downcast_ref::<store::ConflictError>() {
+            let output = if let Some(conflict) = error.downcast_ref::<store::HashConflictError>() {
                 json!({
                     "error": {
-                        "kind": "conflict",
+                        "kind": "hash_conflict",
                         "message": conflict.to_string(),
-                        "eid": conflict.eid,
-                        "attr": conflict.attr,
                         "expected": conflict.expected,
                         "current": conflict.current
                     }
@@ -333,18 +346,70 @@ async fn run(cli: Cli) -> Result<Option<Value>, Box<dyn std::error::Error>> {
         Command::IncomeStatement(args) => {
             ledger::balance(&mut store, &args, ledger::ReportKind::IncomeStatement).await?
         }
-        Command::AddTransaction(data) => store.add_transaction(parse_data(&data.data)?).await?,
-        Command::AddAccount(data) => store.add_simple("account", parse_data(&data.data)?).await?,
-        Command::AddCommodity(data) => {
+        Command::AddTransaction(data) => {
             store
-                .add_simple("commodity", parse_data(&data.data)?)
+                .add_transaction(parse_data(&data.data)?, data.writer_external_id.as_deref())
                 .await?
         }
-        Command::AddPrice(data) => store.add_simple("price", parse_data(&data.data)?).await?,
-        Command::AddInclude(data) => store.add_simple("include", parse_data(&data.data)?).await?,
-        Command::Update(data) => store.update_entity(parse_data(&data.data)?).await?,
-        Command::Delete(args) => store.delete_entity(args.eid).await?,
-        Command::ImportJournals(args) => store.import_journals(&args.source).await?,
+        Command::AddAccount(data) => {
+            store
+                .add_simple(
+                    "account",
+                    parse_data(&data.data)?,
+                    data.writer_external_id.as_deref(),
+                )
+                .await?
+        }
+        Command::AddCommodity(data) => {
+            store
+                .add_simple(
+                    "commodity",
+                    parse_data(&data.data)?,
+                    data.writer_external_id.as_deref(),
+                )
+                .await?
+        }
+        Command::AddPrice(data) => {
+            store
+                .add_simple(
+                    "price",
+                    parse_data(&data.data)?,
+                    data.writer_external_id.as_deref(),
+                )
+                .await?
+        }
+        Command::AddInclude(data) => {
+            store
+                .add_simple(
+                    "include",
+                    parse_data(&data.data)?,
+                    data.writer_external_id.as_deref(),
+                )
+                .await?
+        }
+        Command::Update(data) => {
+            store
+                .update_entity(parse_data(&data.data)?, data.writer_external_id.as_deref())
+                .await?
+        }
+        Command::Delete(args) => {
+            store
+                .delete_entity(
+                    args.eid,
+                    &args.last_hash,
+                    args.writer_external_id.as_deref(),
+                )
+                .await?
+        }
+        Command::ImportJournals(args) => {
+            store
+                .import_journals(
+                    &args.source,
+                    &args.last_hash,
+                    args.writer_external_id.as_deref(),
+                )
+                .await?
+        }
     };
     Ok(Some(value))
 }

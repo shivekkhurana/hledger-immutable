@@ -6,6 +6,7 @@ use std::{
 };
 
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use sqlx::{
     QueryBuilder, Row, Sqlite, SqlitePool,
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous},
@@ -22,24 +23,18 @@ pub struct Store {
 }
 
 #[derive(Debug)]
-pub struct ConflictError {
-    pub eid: i64,
-    pub attr: String,
-    pub expected: Value,
-    pub current: Value,
+pub struct HashConflictError {
+    pub expected: String,
+    pub current: String,
 }
 
-impl fmt::Display for ConflictError {
+impl fmt::Display for HashConflictError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "safe update conflict for eid {} attribute {}",
-            self.eid, self.attr
-        )
+        write!(formatter, "workspace changed since lastHash was read")
     }
 }
 
-impl std::error::Error for ConflictError {}
+impl std::error::Error for HashConflictError {}
 
 impl Store {
     pub async fn open(workspace: &Path) -> Result<Self, Box<dyn std::error::Error>> {
@@ -61,6 +56,7 @@ impl Store {
             pool,
             workspace: workspace.display().to_string(),
         };
+        store.ensure_datom_hashes().await?;
         store.ensure_current_projection().await?;
         Ok(store)
     }
@@ -74,8 +70,47 @@ impl Store {
             "workspace": &self.workspace,
             "latest_sequence": row.try_get::<Option<i64>, _>("sequence")?,
             "datom_count": row.try_get::<i64, _>("datom_count")?,
+            "lastHash": current_state_hash(&self.pool).await?,
             "source_of_truth": "event_log"
         }))
+    }
+
+    async fn ensure_datom_hashes(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let unhashed: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM event_log WHERE datom_hash IS NULL")
+                .fetch_one(&self.pool)
+                .await?;
+        if unhashed == 0 {
+            return Ok(());
+        }
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let rows = sqlx::query(
+            "SELECT sequence, eid, attr, value_json, retract, writer_external_id \
+             FROM event_log ORDER BY sequence",
+        )
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut previous_hash = "0".to_owned();
+        for row in rows {
+            let sequence: i64 = row.try_get("sequence")?;
+            previous_hash = next_datom_hash(
+                &previous_hash,
+                sequence,
+                row.try_get("eid")?,
+                &row.try_get::<String, _>("attr")?,
+                &row.try_get::<String, _>("value_json")?,
+                row.try_get("retract")?,
+                row.try_get::<Option<String>, _>("writer_external_id")?
+                    .as_deref(),
+            );
+            sqlx::query("UPDATE event_log SET datom_hash = ?1 WHERE sequence = ?2")
+                .bind(&previous_hash)
+                .bind(sequence)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(())
     }
 
     pub async fn entities(&self) -> Result<BTreeMap<i64, Entity>, Box<dyn std::error::Error>> {
@@ -186,8 +221,11 @@ impl Store {
         &mut self,
         entity_type: &str,
         data: Value,
+        writer_external_id: Option<&str>,
     ) -> Result<Value, Box<dyn std::error::Error>> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let expected_hash = required_string(&data, "lastHash")?.to_owned();
+        check_state_hash(&mut tx, &expected_hash).await?;
         let eid = allocate_eid(&mut tx).await?;
         let group = required_string(&data, "file")?;
         let position = eid * 1000;
@@ -213,16 +251,22 @@ impl Store {
                 .ok_or_else(|| format!("Missing required field: {input_key}"))?;
             datoms.push((eid, attr, value.clone()));
         }
-        append_datoms(&mut tx, &datoms).await?;
+        append_datoms(&mut tx, &datoms, writer_external_id).await?;
+        let last_hash = current_state_hash_tx(&mut tx).await?;
         tx.commit().await?;
-        Ok(json!({"eid": eid, "type": entity_type, "sequence": latest_sequence(&self.pool).await?}))
+        Ok(
+            json!({"eid": eid, "type": entity_type, "sequence": latest_sequence(&self.pool).await?, "lastHash": last_hash}),
+        )
     }
 
     pub async fn add_transaction(
         &mut self,
         data: Value,
+        writer_external_id: Option<&str>,
     ) -> Result<Value, Box<dyn std::error::Error>> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let expected_hash = required_string(&data, "lastHash")?.to_owned();
+        check_state_hash(&mut tx, &expected_hash).await?;
         let root = allocate_eid(&mut tx).await?;
         let group = required_string(&data, "file")?;
         let date = required_value(&data, "date")?;
@@ -262,25 +306,28 @@ impl Store {
             }
             add_tags(&mut tx, &mut datoms, eid, posting.get("tags")).await?;
         }
-        append_datoms(&mut tx, &datoms).await?;
+        append_datoms(&mut tx, &datoms, writer_external_id).await?;
+        let last_hash = current_state_hash_tx(&mut tx).await?;
         tx.commit().await?;
         Ok(
-            json!({"eid": root, "type": "transaction", "sequence": latest_sequence(&self.pool).await?}),
+            json!({"eid": root, "type": "transaction", "sequence": latest_sequence(&self.pool).await?, "lastHash": last_hash}),
         )
     }
 
     pub async fn update_entity(
         &mut self,
         data: Value,
+        writer_external_id: Option<&str>,
     ) -> Result<Value, Box<dyn std::error::Error>> {
         let eid = data
             .get("eid")
             .and_then(Value::as_i64)
             .ok_or("eid must be an integer")?;
         let attr = required_string(&data, "attr")?;
-        let expected = required_value(&data, "expect")?;
+        let expected_hash = required_string(&data, "lastHash")?.to_owned();
         let value = required_value(&data, "value")?;
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        check_state_hash(&mut tx, &expected_hash).await?;
         let entities = load_current_entities(&mut tx, &BTreeSet::from([eid])).await?;
         let entity = entities
             .get(&eid)
@@ -303,37 +350,37 @@ impl Store {
             .attributes
             .get(&attr)
             .ok_or_else(|| format!("Attribute {attr:?} is not set on entity {eid}"))?;
-        if current != &expected {
-            return Err(Box::new(ConflictError {
-                eid,
-                attr,
-                expected,
-                current: current.clone(),
-            }));
-        }
         if current == &value {
             let sequence: Option<i64> = sqlx::query_scalar("SELECT max(sequence) FROM event_log")
                 .fetch_one(&mut *tx)
                 .await?;
-            tx.commit().await?;
             return Ok(
-                json!({"eid": eid, "attr": attr, "value": value, "sequence": sequence, "unchanged": true}),
+                json!({"eid": eid, "attr": attr, "value": value, "sequence": sequence, "unchanged": true, "lastHash": expected_hash}),
             );
         }
         let datoms = [
             (eid, attr.as_str(), current.clone(), true),
             (eid, attr.as_str(), value.clone(), false),
         ];
-        append_datom_events(&mut tx, &datoms).await?;
+        append_datom_events(&mut tx, &datoms, writer_external_id).await?;
         let sequence: Option<i64> = sqlx::query_scalar("SELECT max(sequence) FROM event_log")
             .fetch_one(&mut *tx)
             .await?;
+        let last_hash = current_state_hash_tx(&mut tx).await?;
         tx.commit().await?;
-        Ok(json!({"eid": eid, "attr": attr, "value": value, "sequence": sequence}))
+        Ok(
+            json!({"eid": eid, "attr": attr, "value": value, "sequence": sequence, "lastHash": last_hash}),
+        )
     }
 
-    pub async fn delete_entity(&mut self, eid: i64) -> Result<Value, Box<dyn std::error::Error>> {
+    pub async fn delete_entity(
+        &mut self,
+        eid: i64,
+        expected_hash: &str,
+        writer_external_id: Option<&str>,
+    ) -> Result<Value, Box<dyn std::error::Error>> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        check_state_hash(&mut tx, expected_hash).await?;
         let all_entities = load_all_current_entities(&mut tx).await?;
         if !all_entities.contains_key(&eid) {
             return Err(format!("Entity {eid} does not exist").into());
@@ -366,17 +413,22 @@ impl Store {
                     .map(move |(attr, value)| (*deleted_eid, attr.as_str(), value.clone(), true))
             })
             .collect::<Vec<_>>();
-        append_datom_events(&mut tx, &datoms).await?;
+        append_datom_events(&mut tx, &datoms, writer_external_id).await?;
         let sequence: Option<i64> = sqlx::query_scalar("SELECT max(sequence) FROM event_log")
             .fetch_one(&mut *tx)
             .await?;
+        let last_hash = current_state_hash_tx(&mut tx).await?;
         tx.commit().await?;
-        Ok(json!({"eid": eid, "deleted_eids": deleted_eids, "sequence": sequence}))
+        Ok(
+            json!({"eid": eid, "deleted_eids": deleted_eids, "sequence": sequence, "lastHash": last_hash}),
+        )
     }
 
     pub async fn import_journals(
         &mut self,
         source: &Path,
+        expected_hash: &str,
+        writer_external_id: Option<&str>,
     ) -> Result<Value, Box<dyn std::error::Error>> {
         let journal_import = importer::read_folder(source)?;
         let source_files = journal_import.source_files;
@@ -387,6 +439,7 @@ impl Store {
             .count();
 
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        check_state_hash(&mut tx, expected_hash).await?;
         let existing_datoms: i64 = sqlx::query_scalar("SELECT count(*) FROM event_log")
             .fetch_one(&mut *tx)
             .await?;
@@ -493,7 +546,8 @@ impl Store {
         }
 
         let datom_count = datoms.len();
-        append_datoms(&mut tx, &datoms).await?;
+        append_datoms(&mut tx, &datoms, writer_external_id).await?;
+        let last_hash = current_state_hash_tx(&mut tx).await?;
         tx.commit().await?;
         Ok(json!({
             "imported": true,
@@ -501,7 +555,8 @@ impl Store {
             "entities": imported.len(),
             "transactions": transaction_count,
             "datoms": datom_count,
-            "latest_sequence": latest_sequence(&self.pool).await?
+            "latest_sequence": latest_sequence(&self.pool).await?,
+            "lastHash": last_hash
         }))
     }
 }
@@ -545,18 +600,29 @@ async fn allocate_eid(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>) -> Result<i6
 async fn append_datoms(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     datoms: &[(i64, &str, Value)],
+    writer_external_id: Option<&str>,
 ) -> Result<(), sqlx::Error> {
     let events = datoms
         .iter()
         .map(|(eid, attr, value)| (*eid, *attr, value.clone(), false))
         .collect::<Vec<_>>();
-    append_datom_events(tx, &events).await
+    append_datom_events(tx, &events, writer_external_id).await
 }
 
 async fn append_datom_events(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     datoms: &[(i64, &str, Value, bool)],
+    writer_external_id: Option<&str>,
 ) -> Result<(), sqlx::Error> {
+    let mut previous_hash = current_state_hash_tx(tx).await?;
+    let mut sequence: i64 = sqlx::query_scalar(
+        "SELECT max(\
+             coalesce((SELECT seq FROM sqlite_sequence WHERE name = 'event_log'), 0), \
+             coalesce((SELECT max(sequence) FROM event_log), 0)\
+         ) + 1",
+    )
+    .fetch_one(&mut **tx)
+    .await?;
     let touched_eids = datoms
         .iter()
         .map(|(eid, _, _, _)| *eid)
@@ -565,18 +631,32 @@ async fn append_datom_events(
     let mut latest_sequence = None;
     for (eid, attr, value, retract) in datoms {
         let value_json = serde_json::to_string(value).expect("JSON values serialize");
-        let sequence: i64 = sqlx::query_scalar(
-            "INSERT INTO event_log (eid, attr, value_json, retract) \
-             VALUES (?1, ?2, ?3, ?4) RETURNING sequence",
+        let datom_hash = next_datom_hash(
+            &previous_hash,
+            sequence,
+            *eid,
+            attr,
+            &value_json,
+            i64::from(*retract),
+            writer_external_id,
+        );
+        sqlx::query(
+            "INSERT INTO event_log (sequence, eid, attr, value_json, retract, datom_hash, writer_external_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         )
+        .bind(sequence)
         .bind(eid)
         .bind(attr)
         .bind(&value_json)
         .bind(i64::from(*retract))
-        .fetch_one(&mut **tx)
+        .bind(&datom_hash)
+        .bind(writer_external_id)
+        .execute(&mut **tx)
         .await?;
+        previous_hash = datom_hash;
         apply_current_datom(&mut current_entities, *eid, attr, value, *retract, sequence);
         latest_sequence = Some(sequence);
+        sequence += 1;
     }
     replace_current_entities(tx, &touched_eids, &current_entities).await?;
     if let Some(latest_sequence) = latest_sequence {
@@ -589,6 +669,65 @@ async fn append_datom_events(
         .await?;
     }
     Ok(())
+}
+
+async fn check_state_hash(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    expected: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let current = current_state_hash_tx(tx).await?;
+    if current != expected {
+        return Err(Box::new(HashConflictError {
+            expected: expected.to_owned(),
+            current,
+        }));
+    }
+    Ok(())
+}
+
+async fn current_state_hash_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+) -> Result<String, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT coalesce((SELECT datom_hash FROM event_log ORDER BY sequence DESC LIMIT 1), '0')",
+    )
+    .fetch_one(&mut **tx)
+    .await
+}
+
+async fn current_state_hash(pool: &SqlitePool) -> Result<String, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT coalesce((SELECT datom_hash FROM event_log ORDER BY sequence DESC LIMIT 1), '0')",
+    )
+    .fetch_one(pool)
+    .await
+}
+
+fn next_datom_hash(
+    previous: &str,
+    sequence: i64,
+    eid: i64,
+    attr: &str,
+    value_json: &str,
+    retract: i64,
+    writer_external_id: Option<&str>,
+) -> String {
+    let mut content_digest = Sha256::new();
+    content_digest.update(sequence.to_string().as_bytes());
+    content_digest.update(eid.to_string().as_bytes());
+    content_digest.update(attr.as_bytes());
+    content_digest.update(value_json.as_bytes());
+    content_digest.update(retract.to_string().as_bytes());
+    if let Some(writer_external_id) = writer_external_id {
+        content_digest.update([1]);
+        content_digest.update(writer_external_id.as_bytes());
+    }
+    let content_hash = format!("{:x}", content_digest.finalize());
+
+    let mut chain_digest = Sha256::new();
+    chain_digest.update(previous.as_bytes());
+    chain_digest.update(content_hash.as_bytes());
+    format!("{:x}", chain_digest.finalize())
 }
 
 fn mutable_attribute(entity_type: &str, attr: &str) -> bool {

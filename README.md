@@ -50,9 +50,9 @@ defaults to the current directory; pass `--workspace` to select another one.
 ./target/release/hledger-immutable --workspace ./books status
 ./target/release/hledger-immutable --workspace ./books accounts --file main.journal
 ./target/release/hledger-immutable --workspace ./books balance --file main.journal -X USD --monthly -p 2025
-./target/release/hledger-immutable --workspace ./books add-transaction --data '{"file":"personal.journal","date":"2026-09-27","description":"Lunch","postings":[{"account":"Expenses:Food","amount":"INR 500"},{"account":"Assets:Cash"}]}'
-./target/release/hledger-immutable --workspace ./books update --data '{"eid":42,"attr":"posting/amount","expect":"INR 500","value":"INR 550"}'
-./target/release/hledger-immutable --workspace ./books delete --eid 42
+./target/release/hledger-immutable --workspace ./books add-transaction --writer-external-id ui-user-42 --data '{"lastHash":"HASH_FROM_STATUS","file":"personal.journal","date":"2026-09-27","description":"Lunch","postings":[{"account":"Expenses:Food","amount":"INR 500"},{"account":"Assets:Cash"}]}'
+./target/release/hledger-immutable --workspace ./books update --data '{"eid":42,"attr":"posting/amount","lastHash":"HASH_FROM_STATUS","value":"INR 550"}'
+./target/release/hledger-immutable --workspace ./books delete --eid 42 --last-hash HASH_FROM_STATUS
 ```
 
 Read commands are `accounts`, `commodities`, `print`, `balance` (`bal`),
@@ -65,10 +65,20 @@ Custom reports can be built on the JSON results.
 
 Write commands include transactions, accounts, commodities, prices, include
 relationships, safe single-attribute updates, and logical entity deletion.
-`update` requires the exact current value in `expect`; stale values return a
-structured conflict and append no datoms. `delete` appends retractions for the
-entity and owned postings and tags. Neither command rewrites event-log history
-or blocks writes because a transaction is unbalanced.
+`status` returns the current workspace `lastHash`. Every mutation requires the
+hash returned by the latest read: add and update commands take `lastHash` in
+their JSON data, while `delete` and `import-journals` take `--last-hash`. If any
+event-log write happened after the hash was read, the command returns a
+structured `hash_conflict` and appends no datoms. Successful mutations return
+the new `lastHash`. Hash checks and appends run in the same SQLite transaction.
+The hash is initialized from the existing event log when an older workspace is
+opened. `delete` appends retractions for the entity and owned postings and tags.
+Writes do not rewrite event-log history or block writes because a transaction
+is unbalanced.
+
+Every mutation also accepts optional `--writer-external-id ID`. The value is
+stored on every datom produced by that command, including retractions, and is
+included in the datom hash chain for audit attribution.
 
 ## Import existing journal files
 
@@ -79,7 +89,7 @@ files are opened only for reading and are never rewritten. The import is
 all-or-nothing and is allowed only when the workspace event log is empty.
 
 ```sh
-./target/release/hledger-immutable --workspace ./books import-journals --source ~/Wip/hledger/journals
+./target/release/hledger-immutable --workspace ./books import-journals --source ~/Wip/hledger/journals --last-hash HASH_FROM_STATUS
 ```
 
 The importer handles transactions and postings, account and commodity
