@@ -51,6 +51,8 @@ defaults to the current directory; pass `--workspace` to select another one.
 ./target/release/hledger-immutable --workspace ./books accounts --file main.journal
 ./target/release/hledger-immutable --workspace ./books balance --file main.journal -X USD --monthly -p 2025
 ./target/release/hledger-immutable --workspace ./books add-transaction --data '{"file":"personal.journal","date":"2026-09-27","description":"Lunch","postings":[{"account":"Expenses:Food","amount":"INR 500"},{"account":"Assets:Cash"}]}'
+./target/release/hledger-immutable --workspace ./books update --data '{"eid":42,"attr":"posting/amount","expect":"INR 500","value":"INR 550"}'
+./target/release/hledger-immutable --workspace ./books delete --eid 42
 ```
 
 Read commands are `accounts`, `commodities`, `print`, `balance` (`bal`),
@@ -61,9 +63,12 @@ balances, account include/exclude queries, depth, and tag filters (`--tag
 NAME` or `--tag NAME=VALUE`). `--file`/`-F` follows source-group includes.
 Custom reports can be built on the JSON results.
 
-Write commands currently include transactions, accounts, commodities, prices,
-and include relationships. Amend/delete commands and less common report
-semantics remain to be implemented.
+Write commands include transactions, accounts, commodities, prices, include
+relationships, safe single-attribute updates, and logical entity deletion.
+`update` requires the exact current value in `expect`; stale values return a
+structured conflict and append no datoms. `delete` appends retractions for the
+entity and owned postings and tags. Neither command rewrites event-log history
+or blocks writes because a transaction is unbalanced.
 
 ## Import existing journal files
 

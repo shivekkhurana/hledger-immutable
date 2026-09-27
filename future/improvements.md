@@ -9,14 +9,6 @@ this file as the entry point, and keep detailed design in focused files under
 
 ## Active notes
 
-### `future/safe-updates.md`
-
-Fact-level optimistic concurrency for patch-style UI writes.
-
-The core idea is a compare-and-set update for one `eid + attr`: the caller sends
-the previous value they saw, and the mutation is rejected if the folded current
-value no longer matches.
-
 ### `future/write-integrity-multiplayer.md`
 
 Workspace-level optimistic concurrency using a rolling event-log hash.

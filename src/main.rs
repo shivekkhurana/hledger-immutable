@@ -94,6 +94,14 @@ enum Command {
     #[command(after_help = r#"Example:
   ./target/release/hledger-immutable --workspace ./books add-include --data '{"file":"main.journal","path":"prices.journal"}'"#)]
     AddInclude(JsonData),
+    /// Safely replace one entity attribute when its current value matches.
+    #[command(after_help = r#"Example:
+  ./target/release/hledger-immutable --workspace ./books update --data '{"eid":42,"attr":"posting/amount","expect":"USD -80","value":"USD -90"}'"#)]
+    Update(JsonData),
+    /// Logically delete an entity and its owned child entities.
+    #[command(after_help = r#"Example:
+  ./target/release/hledger-immutable --workspace ./books delete --eid 42"#)]
+    Delete(DeleteArgs),
     /// Read .journal files from a source folder and append them to an empty event log.
     #[command(after_help = r#"Example:
   ./target/release/hledger-immutable --workspace ./books import-journals --source ./journals
@@ -116,6 +124,13 @@ struct ImportArgs {
     /// Folder containing source .journal files. Files are never modified.
     #[arg(short, long)]
     source: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct DeleteArgs {
+    /// Entity id to delete.
+    #[arg(long)]
+    eid: i64,
 }
 
 #[derive(Debug, Args)]
@@ -277,7 +292,21 @@ async fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(error) => {
-            println!("{}", json!({"error": {"message": error.to_string()}}));
+            let output = if let Some(conflict) = error.downcast_ref::<store::ConflictError>() {
+                json!({
+                    "error": {
+                        "kind": "conflict",
+                        "message": conflict.to_string(),
+                        "eid": conflict.eid,
+                        "attr": conflict.attr,
+                        "expected": conflict.expected,
+                        "current": conflict.current
+                    }
+                })
+            } else {
+                json!({"error": {"message": error.to_string()}})
+            };
+            println!("{output}");
             ExitCode::FAILURE
         }
     }
@@ -313,6 +342,8 @@ async fn run(cli: Cli) -> Result<Option<Value>, Box<dyn std::error::Error>> {
         }
         Command::AddPrice(data) => store.add_simple("price", parse_data(&data.data)?).await?,
         Command::AddInclude(data) => store.add_simple("include", parse_data(&data.data)?).await?,
+        Command::Update(data) => store.update_entity(parse_data(&data.data)?).await?,
+        Command::Delete(args) => store.delete_entity(args.eid).await?,
         Command::ImportJournals(args) => store.import_journals(&args.source).await?,
     };
     Ok(Some(value))

@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
+    fmt,
     path::Path,
     time::Duration,
 };
@@ -19,6 +20,26 @@ pub struct Store {
     pool: SqlitePool,
     workspace: String,
 }
+
+#[derive(Debug)]
+pub struct ConflictError {
+    pub eid: i64,
+    pub attr: String,
+    pub expected: Value,
+    pub current: Value,
+}
+
+impl fmt::Display for ConflictError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "safe update conflict for eid {} attribute {}",
+            self.eid, self.attr
+        )
+    }
+}
+
+impl std::error::Error for ConflictError {}
 
 impl Store {
     pub async fn open(workspace: &Path) -> Result<Self, Box<dyn std::error::Error>> {
@@ -248,6 +269,111 @@ impl Store {
         )
     }
 
+    pub async fn update_entity(
+        &mut self,
+        data: Value,
+    ) -> Result<Value, Box<dyn std::error::Error>> {
+        let eid = data
+            .get("eid")
+            .and_then(Value::as_i64)
+            .ok_or("eid must be an integer")?;
+        let attr = required_string(&data, "attr")?;
+        let expected = required_value(&data, "expect")?;
+        let value = required_value(&data, "value")?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let entities = load_current_entities(&mut tx, &BTreeSet::from([eid])).await?;
+        let entity = entities
+            .get(&eid)
+            .ok_or_else(|| format!("Entity {eid} does not exist"))?;
+        let entity_type = entity
+            .attributes
+            .get("entity/type")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("Entity {eid} has no valid entity/type"))?;
+        if !mutable_attribute(entity_type, &attr) {
+            return Err(format!(
+                "Attribute {attr:?} cannot be updated on entity type {entity_type:?}"
+            )
+            .into());
+        }
+        if !value.is_string() {
+            return Err(format!("Value for attribute {attr:?} must be a string").into());
+        }
+        let current = entity
+            .attributes
+            .get(&attr)
+            .ok_or_else(|| format!("Attribute {attr:?} is not set on entity {eid}"))?;
+        if current != &expected {
+            return Err(Box::new(ConflictError {
+                eid,
+                attr,
+                expected,
+                current: current.clone(),
+            }));
+        }
+        if current == &value {
+            let sequence: Option<i64> = sqlx::query_scalar("SELECT max(sequence) FROM event_log")
+                .fetch_one(&mut *tx)
+                .await?;
+            tx.commit().await?;
+            return Ok(
+                json!({"eid": eid, "attr": attr, "value": value, "sequence": sequence, "unchanged": true}),
+            );
+        }
+        let datoms = [
+            (eid, attr.as_str(), current.clone(), true),
+            (eid, attr.as_str(), value.clone(), false),
+        ];
+        append_datom_events(&mut tx, &datoms).await?;
+        let sequence: Option<i64> = sqlx::query_scalar("SELECT max(sequence) FROM event_log")
+            .fetch_one(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(json!({"eid": eid, "attr": attr, "value": value, "sequence": sequence}))
+    }
+
+    pub async fn delete_entity(&mut self, eid: i64) -> Result<Value, Box<dyn std::error::Error>> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let all_entities = load_all_current_entities(&mut tx).await?;
+        if !all_entities.contains_key(&eid) {
+            return Err(format!("Entity {eid} does not exist").into());
+        }
+
+        let mut deleted_eids = BTreeSet::from([eid]);
+        loop {
+            let current_len = deleted_eids.len();
+            for entity in all_entities.values() {
+                let parent = entity
+                    .attributes
+                    .get("posting/parent-eid")
+                    .or_else(|| entity.attributes.get("tag/parent-eid"))
+                    .and_then(Value::as_i64);
+                if parent.is_some_and(|parent| deleted_eids.contains(&parent)) {
+                    deleted_eids.insert(entity.eid);
+                }
+            }
+            if deleted_eids.len() == current_len {
+                break;
+            }
+        }
+
+        let datoms = deleted_eids
+            .iter()
+            .flat_map(|deleted_eid| {
+                all_entities[deleted_eid]
+                    .attributes
+                    .iter()
+                    .map(move |(attr, value)| (*deleted_eid, attr.as_str(), value.clone(), true))
+            })
+            .collect::<Vec<_>>();
+        append_datom_events(&mut tx, &datoms).await?;
+        let sequence: Option<i64> = sqlx::query_scalar("SELECT max(sequence) FROM event_log")
+            .fetch_one(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(json!({"eid": eid, "deleted_eids": deleted_eids, "sequence": sequence}))
+    }
+
     pub async fn import_journals(
         &mut self,
         source: &Path,
@@ -420,24 +546,36 @@ async fn append_datoms(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     datoms: &[(i64, &str, Value)],
 ) -> Result<(), sqlx::Error> {
+    let events = datoms
+        .iter()
+        .map(|(eid, attr, value)| (*eid, *attr, value.clone(), false))
+        .collect::<Vec<_>>();
+    append_datom_events(tx, &events).await
+}
+
+async fn append_datom_events(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    datoms: &[(i64, &str, Value, bool)],
+) -> Result<(), sqlx::Error> {
     let touched_eids = datoms
         .iter()
-        .map(|(eid, _, _)| *eid)
+        .map(|(eid, _, _, _)| *eid)
         .collect::<BTreeSet<_>>();
     let mut current_entities = load_current_entities(tx, &touched_eids).await?;
     let mut latest_sequence = None;
-    for (eid, attr, value) in datoms {
+    for (eid, attr, value, retract) in datoms {
         let value_json = serde_json::to_string(value).expect("JSON values serialize");
         let sequence: i64 = sqlx::query_scalar(
             "INSERT INTO event_log (eid, attr, value_json, retract) \
-             VALUES (?1, ?2, ?3, 0) RETURNING sequence",
+             VALUES (?1, ?2, ?3, ?4) RETURNING sequence",
         )
         .bind(eid)
         .bind(attr)
         .bind(&value_json)
+        .bind(i64::from(*retract))
         .fetch_one(&mut **tx)
         .await?;
-        apply_current_datom(&mut current_entities, *eid, attr, value, false, sequence);
+        apply_current_datom(&mut current_entities, *eid, attr, value, *retract, sequence);
         latest_sequence = Some(sequence);
     }
     replace_current_entities(tx, &touched_eids, &current_entities).await?;
@@ -451,6 +589,28 @@ async fn append_datoms(
         .await?;
     }
     Ok(())
+}
+
+fn mutable_attribute(entity_type: &str, attr: &str) -> bool {
+    match entity_type {
+        "account" => attr == "account/name",
+        "commodity" => attr == "commodity/name",
+        "price" => matches!(attr, "price/date" | "price/commodity" | "price/value"),
+        "include" => attr == "include/file",
+        "transaction" => matches!(
+            attr,
+            "transaction/date"
+                | "transaction/description"
+                | "transaction/status"
+                | "transaction/code"
+        ),
+        "posting" => matches!(
+            attr,
+            "posting/account" | "posting/amount" | "posting/status"
+        ),
+        "tag" => matches!(attr, "tag/name" | "tag/value"),
+        _ => false,
+    }
 }
 
 async fn load_current_entities(
@@ -483,6 +643,33 @@ async fn load_current_entities(
         }
     }
     Ok(entities)
+}
+
+async fn load_all_current_entities(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+) -> Result<BTreeMap<i64, Entity>, sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT eid, first_sequence, attributes_json FROM current_entities ORDER BY eid",
+    )
+    .fetch_all(&mut **tx)
+    .await?;
+    rows.into_iter()
+        .map(|row| {
+            let eid: i64 = row.try_get("eid")?;
+            let attributes = serde_json::from_str::<BTreeMap<String, Value>>(
+                &row.try_get::<String, _>("attributes_json")?,
+            )
+            .map_err(|error| sqlx::Error::Decode(Box::new(error)))?;
+            Ok((
+                eid,
+                Entity {
+                    eid,
+                    first_sequence: row.try_get("first_sequence")?,
+                    attributes,
+                },
+            ))
+        })
+        .collect()
 }
 
 fn apply_current_datom(

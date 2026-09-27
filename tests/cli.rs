@@ -7,7 +7,7 @@ use std::{
 };
 
 use serde_json::{Value, json};
-use sqlx::{Connection, SqliteConnection, sqlite::SqliteConnectOptions};
+use sqlx::{Connection, Row, SqliteConnection, sqlite::SqliteConnectOptions};
 
 static NEXT_WORKSPACE: AtomicU64 = AtomicU64::new(0);
 
@@ -64,6 +64,11 @@ fn succeeds(workspace: &Workspace, args: &[&str]) -> Value {
 fn add_transaction(workspace: &Workspace, data: &Value) -> Value {
     let raw = serde_json::to_string(data).unwrap();
     succeeds(workspace, &["add-transaction", "--data", &raw])
+}
+
+fn update_entity(workspace: &Workspace, data: &Value) -> Value {
+    let raw = serde_json::to_string(data).unwrap();
+    succeeds(workspace, &["update", "--data", &raw])
 }
 
 fn snapshot_files(root: &Path) -> BTreeMap<String, Vec<u8>> {
@@ -539,6 +544,185 @@ fn invalid_json_and_failed_batch_writes_return_json_without_partial_datoms() {
 }
 
 #[test]
+fn update_replaces_an_attribute_and_records_retract_then_assert() {
+    let workspace = Workspace::new();
+    let transaction = add_transaction(
+        &workspace,
+        &json!({
+            "file":"main.journal", "date":"2025-01-01", "description":"Original",
+            "postings":[
+                {"account":"Expenses:Food", "amount":"USD 5"},
+                {"account":"Assets:Cash", "amount":"USD -5"}
+            ]
+        }),
+    );
+    let eid = transaction["eid"].as_i64().unwrap();
+    let before = succeeds(&workspace, &["status"]);
+    let updated = update_entity(
+        &workspace,
+        &json!({"eid":eid,"attr":"transaction/description","expect":"Original","value":"Updated"}),
+    );
+    assert_eq!(updated["eid"], eid);
+    assert_eq!(updated["attr"], "transaction/description");
+    assert_eq!(updated["value"], "Updated");
+    assert_eq!(
+        updated["sequence"].as_i64().unwrap(),
+        before["latest_sequence"].as_i64().unwrap() + 2
+    );
+    assert_eq!(
+        succeeds(&workspace, &["print"])["transactions"][0]["description"],
+        "Updated"
+    );
+
+    let database = workspace.path().join("immutable.sqlite");
+    let options = SqliteConnectOptions::new().filename(&database);
+    let mut connection = futuresless_connect(options);
+    futuresless_block_on(async {
+        let rows = sqlx::query(
+            "SELECT value_json, retract FROM event_log WHERE eid = ?1 AND attr = 'transaction/description' ORDER BY sequence",
+        )
+        .bind(eid)
+        .fetch_all(&mut connection)
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            rows[1].try_get::<String, _>("value_json").unwrap(),
+            "\"Original\""
+        );
+        assert_eq!(rows[1].try_get::<i64, _>("retract").unwrap(), 1);
+        assert_eq!(
+            rows[2].try_get::<String, _>("value_json").unwrap(),
+            "\"Updated\""
+        );
+        assert_eq!(rows[2].try_get::<i64, _>("retract").unwrap(), 0);
+        connection.close().await.unwrap();
+    });
+}
+
+#[test]
+fn stale_update_returns_structured_conflict_without_appending_datoms() {
+    let workspace = Workspace::new();
+    let transaction = add_transaction(
+        &workspace,
+        &json!({
+            "file":"main.journal", "date":"2025-01-01", "description":"Original",
+            "postings":[{"account":"Expenses:Food"}]
+        }),
+    );
+    let eid = transaction["eid"].as_i64().unwrap();
+    update_entity(
+        &workspace,
+        &json!({"eid":eid,"attr":"transaction/description","expect":"Original","value":"First edit"}),
+    );
+    let before = succeeds(&workspace, &["status"]);
+    let output = invoke(
+        &workspace,
+        &[
+            "update",
+            "--data",
+            &serde_json::to_string(&json!({"eid":eid,"attr":"transaction/description","expect":"Original","value":"Stale edit"})).unwrap(),
+        ],
+    );
+    assert!(!output.status.success());
+    let conflict = json_output(output);
+    assert_eq!(conflict["error"]["kind"], "conflict");
+    assert_eq!(conflict["error"]["eid"], eid);
+    assert_eq!(conflict["error"]["attr"], "transaction/description");
+    assert_eq!(conflict["error"]["expected"], "Original");
+    assert_eq!(conflict["error"]["current"], "First edit");
+    assert_eq!(
+        succeeds(&workspace, &["status"])["latest_sequence"],
+        before["latest_sequence"]
+    );
+}
+
+#[test]
+fn update_rejects_structural_attributes_and_wrong_value_types() {
+    let workspace = Workspace::new();
+    let account = succeeds(
+        &workspace,
+        &[
+            "add-account",
+            "--data",
+            r#"{"file":"accounts.journal","name":"Assets:Cash"}"#,
+        ],
+    );
+    let eid = account["eid"].as_i64().unwrap();
+    let before = succeeds(&workspace, &["status"])["latest_sequence"].clone();
+    for data in [
+        json!({"eid":eid,"attr":"entity/type","expect":"account","value":"posting"}),
+        json!({"eid":eid,"attr":"account/name","expect":"Assets:Cash","value":42}),
+    ] {
+        let output = invoke(
+            &workspace,
+            &["update", "--data", &serde_json::to_string(&data).unwrap()],
+        );
+        assert!(!output.status.success());
+    }
+    assert_eq!(succeeds(&workspace, &["status"])["latest_sequence"], before);
+}
+
+#[test]
+fn delete_retracts_root_and_owned_children_and_is_atomic() {
+    let workspace = Workspace::new();
+    let transaction = add_transaction(
+        &workspace,
+        &json!({
+            "file":"main.journal", "date":"2025-01-01", "description":"Delete me",
+            "tags":[{"name":"project","value":"home"}],
+            "postings":[
+                {"account":"Expenses:Food", "amount":"USD 5", "tags":[{"name":"meal"}]},
+                {"account":"Assets:Cash", "amount":"USD -5"}
+            ]
+        }),
+    );
+    let eid = transaction["eid"].as_i64().unwrap();
+    let deleted = succeeds(&workspace, &["delete", "--eid", &eid.to_string()]);
+    assert_eq!(deleted["eid"], eid);
+    assert_eq!(deleted["deleted_eids"].as_array().unwrap().len(), 5);
+    assert_eq!(succeeds(&workspace, &["print"])["count"], 0);
+
+    let database = workspace.path().join("immutable.sqlite");
+    let options = SqliteConnectOptions::new().filename(&database);
+    let mut connection = futuresless_connect(options);
+    futuresless_block_on(async {
+        let retract_count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM event_log WHERE retract = 1")
+                .fetch_one(&mut connection)
+                .await
+                .unwrap();
+        assert!(retract_count >= 20);
+        let live_entities: i64 = sqlx::query_scalar("SELECT count(*) FROM current_entities")
+            .fetch_one(&mut connection)
+            .await
+            .unwrap();
+        assert_eq!(live_entities, 0);
+        let allocated_ids: i64 = sqlx::query_scalar("SELECT count(*) FROM entity_ids")
+            .fetch_one(&mut connection)
+            .await
+            .unwrap();
+        assert_eq!(allocated_ids, 5);
+        connection.close().await.unwrap();
+    });
+}
+
+#[test]
+fn delete_of_missing_entity_appends_no_datoms() {
+    let workspace = Workspace::new();
+    let before = succeeds(&workspace, &["status"])["latest_sequence"].clone();
+    let output = invoke(&workspace, &["delete", "--eid", "999"]);
+    assert!(!output.status.success());
+    assert!(
+        json_output(output)["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("does not exist")
+    );
+    assert_eq!(succeeds(&workspace, &["status"])["latest_sequence"], before);
+}
+
+#[test]
 fn bare_invocation_and_help_options_print_clap_tables() {
     let workspace = Workspace::new();
     let bare = invoke(&workspace, &[]);
@@ -576,6 +760,8 @@ fn every_command_has_individual_documentation_and_add_commands_show_json_example
         "add-commodity",
         "add-price",
         "add-include",
+        "update",
+        "delete",
     ] {
         let output = invoke(&workspace, &[command, "--help"]);
         assert!(output.status.success(), "{command} --help failed");
@@ -605,6 +791,18 @@ fn every_command_has_individual_documentation_and_add_commands_show_json_example
         );
         assert!(help.contains("personal.journal") || command != "add-transaction");
     }
+    assert!(
+        invoke(&workspace, &["update", "--help"])
+            .stdout
+            .windows("posting/amount".len())
+            .any(|window| window == b"posting/amount")
+    );
+    assert!(
+        invoke(&workspace, &["delete", "--help"])
+            .stdout
+            .windows("--eid".len())
+            .any(|window| window == b"--eid")
+    );
 }
 
 #[test]
