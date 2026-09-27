@@ -70,30 +70,81 @@ path dependency from a server in the same workspace:
 
 ```toml
 hledger-immutable = { path = "../hledger-immutable" }
+serde_json = "1"
 ```
 
-Open the workspace once during server startup, keep the `Store` in shared app
-state, and call the async report or mutation functions from request handlers:
+Open the workspace once during server startup, then put the `Store` in the
+server's shared application state. `Store` owns a SQLx connection pool; library
+calls take a shared reference, so handlers can use that shared state without a
+mutex:
 
 ```rust,no_run
 use std::path::Path;
 
-use hledger_immutable::{FilterOptions, Store, ledger};
+use hledger_immutable::{Error, FilterOptions, Store, ledger};
+use serde_json::Value;
 
-async fn read_transactions(store: &Store) -> Result<serde_json::Value, hledger_immutable::Error> {
-    let filters = FilterOptions::default();
+async fn open_store() -> Result<Store, Error> {
+    Store::open(Path::new("./books")).await
+}
+
+async fn read_transactions(store: &Store) -> Result<Value, Error> {
+    let filters = FilterOptions {
+        files: vec!["main.journal".into()],
+        ..FilterOptions::default()
+    };
     ledger::print(store, &filters).await
 }
 
-async fn open_workspace() -> Result<Store, hledger_immutable::Error> {
-    Store::open(Path::new("./books")).await
+async fn monthly_balances(store: &Store) -> Result<Value, Error> {
+    let options = hledger_immutable::ReportOptions {
+        filters: FilterOptions {
+            date_period: Some("2025".into()),
+            ..FilterOptions::default()
+        },
+        interval: Some(hledger_immutable::Period::Monthly),
+        exchange: Some("USD".into()),
+        ..hledger_immutable::ReportOptions::default()
+    };
+    ledger::balance(store, &options, ledger::ReportKind::Balance).await
 }
 ```
 
-The public `options` types are independent of Clap, and the library APIs accept
-shared `&Store` references so servers can put the store in shared application
-state. `Store` owns a SQLx pool and its write methods retain the event-log hash
-check and atomic append behavior.
+`ledger` also exposes `accounts`, `commodities`, `register`, and `balance` (for
+balance sheet and income statement reports). Read results are `serde_json::Value`,
+matching the CLI's JSON output. The `FilterOptions`, `ListOptions`,
+`ReportOptions`, and `Period` types are library types and do not depend on Clap.
+
+Mutations take JSON data like the CLI. Read the current hash first, then include
+it in the mutation data. If another request writes first, the append returns a
+`HashConflictError`; read status again and let the caller retry with the new
+hash if appropriate:
+
+```rust,no_run
+use hledger_immutable::{Error, Store};
+use serde_json::{Value, json};
+
+async fn add_transaction(store: &Store, writer_id: &str) -> Result<Value, Error> {
+    let status = store.status().await?;
+    let data = json!({
+        "lastHash": status["lastHash"],
+        "file": "personal.journal",
+        "date": "2025-04-03",
+        "description": "Groceries",
+        "postings": [
+            {"account": "Expenses:Food", "amount": "USD 25"},
+            {"account": "Assets:Cash", "amount": "USD -25"}
+        ]
+    });
+    store.add_transaction(data, Some(writer_id)).await
+}
+```
+
+Other write methods are `add_simple` (for `account`, `commodity`, `price`, or
+`include`), `update_entity`, `delete_entity`, and `import_journals`. They keep
+the same hash check and atomic append behavior as the CLI. The library also
+exports `Store::entities()` for applications that need the current folded
+entities directly.
 
 Write commands include transactions, accounts, commodities, prices, include
 relationships, safe single-attribute updates, and logical entity deletion.
